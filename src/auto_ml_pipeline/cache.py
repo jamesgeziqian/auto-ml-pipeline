@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .logging_utils import Heartbeat, format_bytes, rss_mb
+from .logging_utils import Heartbeat, format_bytes
 from .schema import LabelInfo, SourceSpec
-
 
 ROW_INDEX = "__row_index__"
 
@@ -73,20 +71,10 @@ def _convert_columns(
     dtypes: Dict[str, str],
     numeric_dtype: Any = np.float64,
 ) -> pd.DataFrame:
-    numeric_columns = [
-        column
-        for column, dtype in dtypes.items()
-        if dtype == "numeric" and column in chunk.columns
-    ]
-    datetime_columns = [
-        column
-        for column, dtype in dtypes.items()
-        if dtype == "datetime" and column in chunk.columns
-    ]
+    numeric_columns = [column for column, dtype in dtypes.items() if dtype == "numeric" and column in chunk.columns]
+    datetime_columns = [column for column, dtype in dtypes.items() if dtype == "datetime" and column in chunk.columns]
     categorical_columns = [
-        column
-        for column, dtype in dtypes.items()
-        if dtype not in {"numeric", "datetime"} and column in chunk.columns
+        column for column, dtype in dtypes.items() if dtype not in {"numeric", "datetime"} and column in chunk.columns
     ]
     if numeric_columns:
         values = chunk[numeric_columns]
@@ -141,9 +129,7 @@ def _ingest_blocked_wide(
     """
 
     groups = _partitions(logical_columns, block_size)
-    logical_to_source_col = {
-        logical: source_col for source_col, logical in source_to_logical.items()
-    }
+    logical_to_source_col = {logical: source_col for source_col, logical in source_to_logical.items()}
     all_source_columns = [logical_to_source_col[column] for column in logical_columns]
     paths: Dict[int, Path] = {}
     schemas: Dict[int, pa.Schema] = {}
@@ -161,9 +147,7 @@ def _ingest_blocked_wide(
         schema = pa.schema(fields)
         paths[group_index] = path
         schemas[group_index] = schema
-        writers[group_index] = pq.ParquetWriter(
-            path, schema, compression="zstd", use_dictionary=True
-        )
+        writers[group_index] = pq.ParquetWriter(path, schema, compression="zstd", use_dictionary=True)
 
     rows_seen = 0
     rows_written = 0
@@ -192,16 +176,12 @@ def _ingest_blocked_wide(
             rows_seen += len(chunk)
             chunk.columns = [str(column) for column in chunk.columns]
             missing_keys += int(chunk[source.key_col].isna().sum())
-            chunk, missing = _align_chunk(
-                chunk, source.key_col, key_index, source.source_id
-            )
+            chunk, missing = _align_chunk(chunk, source.key_col, key_index, source.source_id)
             missing_keys += missing
             if chunk.empty:
                 continue
 
-            rename_map = {
-                source_col: logical for source_col, logical in source_to_logical.items()
-            }
+            rename_map = {source_col: logical for source_col, logical in source_to_logical.items()}
             chunk = chunk.drop(columns=[source.key_col]).rename(columns=rename_map)
             chunk = _convert_columns(chunk, dtype_by_logical, numeric_dtype)
             chunk = chunk[[ROW_INDEX] + logical_columns]
@@ -215,15 +195,12 @@ def _ingest_blocked_wide(
                 frame = chunk[[ROW_INDEX] + group]
                 table = pa.Table.from_pandas(frame, preserve_index=False)
                 table = table.cast(schemas[group_index])
-                writers[group_index].write_table(
-                    table, row_group_size=row_group_size
-                )
+                writers[group_index].write_table(table, row_group_size=row_group_size)
 
             if chunk_number % 10 == 0:
                 elapsed = max(1e-9, time.perf_counter() - source_started)
                 logger.info(
-                    "[ingest] %s wide-chunk=%s rows=%s written=%s missing_keys=%s "
-                    "speed=%.0f rows/s blocks=%s",
+                    "[ingest] %s wide-chunk=%s rows=%s written=%s missing_keys=%s " "speed=%.0f rows/s blocks=%s",
                     source.source_id,
                     chunk_number,
                     rows_seen,
@@ -233,8 +210,7 @@ def _ingest_blocked_wide(
                     len(groups),
                 )
                 heartbeat.detail(
-                    f"wide source={source.source_id} chunk={chunk_number} "
-                    f"rows={rows_written} blocks={len(groups)}"
+                    f"wide source={source.source_id} chunk={chunk_number} " f"rows={rows_written} blocks={len(groups)}"
                 )
     finally:
         for writer in writers.values():
@@ -310,19 +286,12 @@ def build_cache(
             target_bytes,
         )
         dtype_by_logical = {column: source.dtypes[column] for column in logical_columns}
-        source_to_logical = {
-            column: source.source_to_logical[column]
-            for column in logical_columns
-        }
-        logical_to_source_col = {
-            logical: source_col for source_col, logical in source_to_logical.items()
-        }
+        source_to_logical = {column: source.source_to_logical[column] for column in logical_columns}
+        logical_to_source_col = {logical: source_col for source_col, logical in source_to_logical.items()}
 
         projected = n_read_columns > max_in_memory
         numeric_dtype = (
-            np.float32
-            if str(data.get("cache_numeric_dtype", "float64")).lower() == "float32"
-            else np.float64
+            np.float32 if str(data.get("cache_numeric_dtype", "float64")).lower() == "float32" else np.float64
         )
         parts_meta: List[Dict[str, Any]] = []
         rows_written = 0
@@ -389,17 +358,12 @@ def build_cache(
                 chunk.columns = [str(column) for column in chunk.columns]
                 missing_key_values = int(chunk[source.key_col].isna().sum())
                 missing_keys += missing_key_values
-                chunk, missing = _align_chunk(
-                    chunk, source.key_col, key_index, source.source_id
-                )
+                chunk, missing = _align_chunk(chunk, source.key_col, key_index, source.source_id)
                 missing_keys += missing
                 if chunk.empty:
                     continue
 
-                rename_map = {
-                    source_col: logical
-                    for source_col, logical in zip(source_columns, group)
-                }
+                rename_map = {source_col: logical for source_col, logical in zip(source_columns, group)}
                 chunk = chunk.drop(columns=[source.key_col]).rename(columns=rename_map)
                 chunk = _convert_columns(chunk, dtype_by_logical, numeric_dtype)
                 chunk = chunk[[ROW_INDEX] + group]
@@ -424,10 +388,7 @@ def build_cache(
                         rows_written / elapsed,
                         format_bytes(bytes_written),
                     )
-                    heartbeat.detail(
-                        f"source={source.source_id} chunk={chunk_number} "
-                        f"rows={rows_written}"
-                    )
+                    heartbeat.detail(f"source={source.source_id} chunk={chunk_number} " f"rows={rows_written}")
 
             parts_meta.append({"columns": group, "parts": part_paths})
 
@@ -534,8 +495,7 @@ class CacheStore:
         self.n_rows = int(manifest["n_rows"])
         self.column_dtypes: Dict[str, str] = dict(manifest["column_dtypes"])
         self.column_sources: Dict[str, List[str]] = {
-            column: list(source_ids)
-            for column, source_ids in manifest["column_sources"].items()
+            column: list(source_ids) for column, source_ids in manifest["column_sources"].items()
         }
 
     @classmethod
@@ -559,11 +519,7 @@ class CacheStore:
     ) -> pd.DataFrame:
         source_meta = self.manifest["sources"][source_id]
         logical_columns = set(source_meta["logical_columns"])
-        wanted = {
-            logical: source_col
-            for logical, source_col in selected.items()
-            if logical in logical_columns
-        }
+        wanted = {logical: source_col for logical, source_col in selected.items() if logical in logical_columns}
         if not wanted:
             return pd.DataFrame()
 

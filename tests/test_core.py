@@ -8,11 +8,13 @@ import pandas as pd
 import pytest
 
 from auto_ml_pipeline.config import ConfigError, load_config
+from auto_ml_pipeline.logging_utils import configure_logging
 from auto_ml_pipeline.metrics import (
     ks_statistic,
     multiclass_metrics,
     select_binary_threshold,
 )
+from auto_ml_pipeline.schema import discover_sources, load_labels
 from auto_ml_pipeline.stats import _information_value, _psi
 from auto_ml_pipeline.synthetic import generate_synthetic_dataset
 
@@ -128,3 +130,97 @@ def test_synthetic_generator(tmp_path: Path) -> None:
     assert Path(info["label_file"]).exists()
     with (tmp_path / "data" / "dataset_info.json").open(encoding="utf-8") as handle:
         assert json.load(handle)["rows"] == 300
+
+
+def test_row_concat_partition_sampling_dtype_conflicts(tmp_path: Path) -> None:
+    n_parts = 3
+    rows_per_part = 200
+    n_rows = n_parts * rows_per_part
+    feature_paths = []
+    for part in range(n_parts):
+        start = part * rows_per_part
+        stop = start + rows_per_part
+        identifiers = [f"id_{index}" for index in range(start, stop)]
+        values = (
+            [1000 + index % 10 for index in range(start, stop)] if part == 0 else list(range(1000, 1000 + stop - start))
+        )
+        categories = (
+            [f"category_{index % 20}" for index in range(start, stop)]
+            if part == 0
+            else [f"category_{index}" for index in range(start, stop)]
+        )
+        constant_partition = [7] * (stop - start) if part == 0 else list(range(start, stop))
+        null_partition = [None] * (stop - start) if part == 0 else [value + 0.5 for value in range(start, stop)]
+        all_null = [None] * (stop - start)
+        path = tmp_path / f"features_part_{part}.csv"
+        pd.DataFrame(
+            {
+                "id": identifiers,
+                "col4": values,
+                "col13": categories,
+                "stable": [index % 2 for index in range(start, stop)],
+                "constant_partition": constant_partition,
+                "null_partition": null_partition,
+                "all_null": all_null,
+            }
+        ).to_csv(path, index=False)
+        feature_paths.append(str(path))
+
+    pd.DataFrame(
+        {
+            "id": [f"id_{index}" for index in range(n_rows)],
+            "target": [index % 2 for index in range(n_rows)],
+        }
+    ).to_csv(tmp_path / "labels.csv", index=False)
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "project:",
+                f"  work_dir: {tmp_path / 'run'}",
+                "data:",
+                "  feature_paths:",
+                f"    - {tmp_path / 'features_part_*.csv'}",
+                f"  label_path: {tmp_path / 'labels.csv'}",
+                "  feature_key: id",
+                "  label_key: id",
+                "  label_column: target",
+                "  concat_mode: row",
+                "  include_label_features: false",
+                "  sample_rows: 200",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(config_path)
+    logger = configure_logging("WARNING")
+    label_info = load_labels(cfg, logger)
+    sources, _ = discover_sources(cfg, label_info, logger)
+    feature_sources = [source for source in sources if source.kind == "features"]
+
+    assert [source.dtypes["col4"] for source in feature_sources] == [
+        "numeric",
+        "numeric",
+        "numeric",
+    ]
+    assert [source.dtypes["col13"] for source in feature_sources] == [
+        "categorical",
+        "categorical",
+        "categorical",
+    ]
+    assert [source.dtypes["constant_partition"] for source in feature_sources] == [
+        "numeric",
+        "numeric",
+        "numeric",
+    ]
+    assert [source.dtypes["null_partition"] for source in feature_sources] == [
+        "numeric",
+        "numeric",
+        "numeric",
+    ]
+    assert [source.dtypes["all_null"] for source in feature_sources] == [
+        "categorical",
+        "categorical",
+        "categorical",
+    ]

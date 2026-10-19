@@ -15,9 +15,22 @@ from sklearn.model_selection import train_test_split
 from .config import ConfigError
 from .logging_utils import format_bytes
 
-
 NUMERIC_TYPES = {"numeric", "datetime"}
 CATEGORICAL_TYPES = {"categorical", "identifier"}
+
+
+def _merge_row_types(previous_type: str, current_type: str) -> str:
+    """Return a common row-concat type for compatible partition inferences."""
+    if previous_type == "unknown":
+        return current_type
+    if current_type == "unknown":
+        return previous_type
+    if previous_type == current_type:
+        return previous_type
+    # CSV has no declared dtype. A string-backed categorical column preserves
+    # every partition's values and avoids rejecting a shared schema solely
+    # because independent samples crossed different inference thresholds.
+    return "categorical"
 
 
 @dataclass
@@ -66,11 +79,11 @@ class LabelInfo:
 
     @property
     def n_rows(self) -> int:
-        return int(len(self.y))
+        return len(self.y)
 
     @property
     def n_classes(self) -> int:
-        return int(len(self.classes))
+        return len(self.classes)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -149,9 +162,16 @@ def _datetime_ratio(series: pd.Series) -> float:
 def infer_column_type(
     series: pd.Series,
     type_cfg: Dict[str, Any],
+    *,
+    row_concat_mode: bool = False,
 ) -> str:
     non_null = series.dropna()
-    if non_null.empty or non_null.nunique(dropna=True) <= 1:
+    if non_null.empty:
+        # A row partition can be entirely null for a column that has values in
+        # another partition. Treat it as neutral so schema reconciliation can
+        # adopt the populated partition's type.
+        return "unknown" if row_concat_mode else "constant"
+    if not row_concat_mode and non_null.nunique(dropna=True) <= 1:
         return "constant"
 
     unique_ratio = float(non_null.nunique(dropna=True) / max(1, len(non_null)))
@@ -162,19 +182,15 @@ def infer_column_type(
     if numeric_ratio >= float(type_cfg.get("numeric_threshold", 0.95)):
         numeric_values = pd.to_numeric(non_null, errors="coerce").dropna()
         if unique_ratio >= identifier_ratio and non_null.nunique() >= identifier_min:
-            integer_like = float(
-                np.isclose(np.mod(numeric_values.to_numpy(dtype=np.float64), 1.0), 0.0).mean()
-            )
+            integer_like = float(np.isclose(np.mod(numeric_values.to_numpy(dtype=np.float64), 1.0), 0.0).mean())
             median_magnitude = float(np.median(np.abs(numeric_values.to_numpy(dtype=np.float64))))
             # Continuous measurements are naturally unique; only large integer-like
             # sequences are treated as identifiers.
-            if integer_like >= 0.98 and median_magnitude >= 1000.0:
+            if not row_concat_mode and integer_like >= 0.98 and median_magnitude >= 1000.0:
                 return "identifier"
         return "numeric"
 
-    if type_cfg.get("detect_datetime") and _datetime_ratio(series) >= float(
-        type_cfg.get("datetime_threshold", 0.98)
-    ):
+    if type_cfg.get("detect_datetime") and _datetime_ratio(series) >= float(type_cfg.get("datetime_threshold", 0.98)):
         return "datetime"
 
     if unique_ratio >= identifier_ratio and non_null.nunique() >= identifier_min:
@@ -200,6 +216,7 @@ def discover_sources(
     used_ids: Dict[str, int] = {}
     sources: List[SourceSpec] = []
     total_sample_bytes = 0.0
+    row_mode = data.get("concat_mode", "column") == "row"
 
     for index, path in enumerate(feature_paths):
         path_obj = Path(path)
@@ -257,7 +274,15 @@ def discover_sources(
             if is_label_source and not data.get("include_label_features", True):
                 spec.dropped_columns[column] = "label features disabled"
                 continue
-            inferred = infer_column_type(sample[column], cfg["type_inference"])
+            # Cardinality and scalar type can depend on which rows happen to be
+            # sampled in each row partition. Defer constant-column removal to
+            # global filtering and keep numeric-backed columns numeric so a shared
+            # schema is not rejected by partition-local inference.
+            inferred = infer_column_type(
+                sample[column],
+                cfg["type_inference"],
+                row_concat_mode=row_mode,
+            )
             if inferred == "constant":
                 spec.dropped_columns[column] = "constant"
                 continue
@@ -268,7 +293,6 @@ def discover_sources(
 
     # Resolve logical column names across sources.
     seen: Dict[str, SourceSpec] = {}
-    row_mode = data.get("concat_mode", "column") == "row"
     for spec in sources:
         for source_column in spec.feature_columns:
             logical = source_column
@@ -278,9 +302,15 @@ def discover_sources(
                     previous_type = previous.dtypes.get(source_column)
                     current_type = spec.dtypes.get(source_column)
                     if previous_type != current_type:
-                        raise ConfigError(
-                            "Row-concatenated sources must agree on dtype for "
-                            f"{source_column!r}: {previous_type} vs {current_type}"
+                        merged_type = _merge_row_types(previous_type, current_type)
+                        logger.warning(
+                            "[schema] row-concat column %r inferred as %s in %s and %s " "in %s; using %s",
+                            source_column,
+                            previous_type,
+                            previous.source_id,
+                            current_type,
+                            spec.source_id,
+                            merged_type,
                         )
                 elif data.get("deduplicate_columns", True):
                     logical = f"{spec.source_id}__{source_column}"
@@ -301,6 +331,19 @@ def discover_sources(
             spec.logical_to_source[logical] = source_column
             if row_mode and logical != source_column:
                 spec.dtypes[logical] = spec.dtypes.pop(source_column)
+
+    if row_mode:
+        resolved_types: Dict[str, str] = {}
+        for spec in sources:
+            for column, dtype in spec.dtypes.items():
+                resolved_types[column] = _merge_row_types(
+                    resolved_types.get(column, "unknown"),
+                    dtype,
+                )
+        for spec in sources:
+            for column in spec.dtypes:
+                resolved = resolved_types[column]
+                spec.dtypes[column] = "categorical" if resolved == "unknown" else resolved
 
     # In row mode, feature files should describe the same table schema.
     if row_mode:
@@ -404,9 +447,7 @@ def load_labels(cfg: Dict[str, Any], logger: Any) -> LabelInfo:
     numeric_labels = _looks_numeric(unique_labels)
     if numeric_labels:
         numeric_values = sorted(float(value) for value in unique_labels)
-        classes: List[Any] = [
-            int(value) if float(value).is_integer() else float(value) for value in numeric_values
-        ]
+        classes: List[Any] = [int(value) if float(value).is_integer() else float(value) for value in numeric_values]
         mapping = {str(value): index for index, value in enumerate(classes)}
     else:
         classes = list(unique_labels)
@@ -497,8 +538,8 @@ def make_splits(
         logger.warning("[split] stratified split failed (%s); falling back to permutation", exc)
         rng = np.random.default_rng(seed)
         shuffled = rng.permutation(indices)
-        n_train = int(round(n_rows * train_fraction))
-        n_valid = int(round(n_rows * valid_fraction))
+        n_train = round(n_rows * train_fraction)
+        n_valid = round(n_rows * valid_fraction)
         train_idx = shuffled[:n_train]
         valid_idx = shuffled[n_train : n_train + n_valid]
         test_idx = shuffled[n_train + n_valid :]
