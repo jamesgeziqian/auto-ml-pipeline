@@ -163,14 +163,40 @@ filtering:
   max_features: 500
   max_pairwise_corr: 0.98
   iv_bins: 10
+  psi_bins: 10
   categorical_top_k: 50
   drop_identifiers: true
   keep_columns: []
+  temporal_psi:
+    enabled: false
+    time_path: null
+    time_key: null
+    time_column: null
+    date_format: null
+    timezone: null
+    reference_start: null
+    reference_end: null
+    comparison_start: null
+    comparison_end: null
+    min_rows_per_period: 100
 ```
 
 - IV uses the training split and quantile bins for numeric columns or the top-K
   categories for categorical columns.
-- PSI compares the training and test split distributions.
+- With temporal PSI disabled, PSI compares the random training and test splits.
+- With temporal PSI enabled, PSI compares two configured time windows. Numeric
+  bin edges and categorical vocabularies are derived from the reference period
+  and then applied to the comparison period.
+- Temporal windows use half-open intervals: `[start, end)`.
+- `time_path` defaults to `data.label_path`. `time_key` defaults to
+  `data.label_key`. The file must contain one unique key per label row and may
+  be a label file or a separate CSV.
+- `date_format` accepts a Python/pandas datetime format such as
+  `"%Y-%m-%d %H:%M:%S"`. Set it to `null` for pandas mixed/ISO inference.
+- The temporal masks and resolved window metadata are saved as
+  `temporal_psi_windows.npz` and `temporal_psi_windows.json`.
+- `filter_report.csv` records `psi_mode`, `psi_reference_n`, and
+  `psi_comparison_n` for each feature.
 - `max_pairwise_corr` optionally removes redundant numeric columns greedily,
   keeping the higher-scoring column from each correlated pair.
 - The full per-column report is written to `filter_report.csv`.

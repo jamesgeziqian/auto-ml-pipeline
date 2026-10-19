@@ -74,6 +74,19 @@ DEFAULTS: Dict[str, Any] = {
         "iv_bins": 10,
         "psi_bins": 10,
         "categorical_top_k": 50,
+        "temporal_psi": {
+            "enabled": False,
+            "time_path": None,
+            "time_key": None,
+            "time_column": None,
+            "date_format": None,
+            "timezone": None,
+            "reference_start": None,
+            "reference_end": None,
+            "comparison_start": None,
+            "comparison_end": None,
+            "min_rows_per_period": 100,
+        },
         "drop_identifiers": True,
         "keep_columns": [],
         "min_row_coverage": 0.0,
@@ -206,6 +219,10 @@ def load_config(path: str | Path, overrides: Optional[Iterable[str]] = None) -> 
 
     data = cfg["data"]
     data["label_path"] = _resolve_input_path(data.get("label_path"), config_dir)
+    temporal_psi = cfg["filtering"]["temporal_psi"]
+    temporal_psi["time_path"] = _resolve_input_path(
+        temporal_psi.get("time_path"), config_dir
+    )
     expanded_paths: List[str] = []
     for entry in _as_list(data.get("feature_paths")):
         resolved = _resolve_input_path(entry, config_dir)
@@ -278,6 +295,39 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ConfigError("tuning.n_trials must be >= 1 when tuning is enabled.")
     if float(project["heartbeat_seconds"]) <= 0:
         raise ConfigError("project.heartbeat_seconds must be positive.")
+
+    temporal_psi = cfg["filtering"]["temporal_psi"]
+    if temporal_psi.get("enabled"):
+        required = [
+            "time_column",
+            "reference_start",
+            "reference_end",
+            "comparison_start",
+            "comparison_end",
+        ]
+        missing = [
+            key
+            for key in required
+            if temporal_psi.get(key) is None or temporal_psi.get(key) == ""
+        ]
+        if missing:
+            raise ConfigError(
+                "filtering.temporal_psi is enabled but is missing: "
+                + ", ".join(missing)
+            )
+        time_path = temporal_psi.get("time_path") or data["label_path"]
+        if not Path(time_path).exists():
+            raise ConfigError(f"Temporal PSI time file does not exist: {time_path}")
+        try:
+            min_rows = int(temporal_psi.get("min_rows_per_period", 0))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "filtering.temporal_psi.min_rows_per_period must be an integer."
+            ) from exc
+        if min_rows < 1:
+            raise ConfigError(
+                "filtering.temporal_psi.min_rows_per_period must be positive."
+            )
 
 
 def config_to_yaml(cfg: Dict[str, Any]) -> str:

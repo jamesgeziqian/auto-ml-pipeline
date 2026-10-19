@@ -12,7 +12,7 @@ import pandas as pd
 
 from .cache import CacheStore
 from .logging_utils import Heartbeat, rss_mb
-
+from .temporal import TemporalPSIWindows
 
 EPS = 1e-9
 
@@ -96,6 +96,21 @@ def _psi(reference_counts: np.ndarray, comparison_counts: np.ndarray) -> float:
     return float(np.sum((ref - cmp) * np.log(ref / cmp)))
 
 
+def _evenly_spaced_indices(
+    indices: np.ndarray,
+    limit: Optional[int],
+) -> np.ndarray:
+    if limit is None or len(indices) <= int(limit):
+        return indices
+    positions = np.linspace(
+        0,
+        len(indices) - 1,
+        max(1, int(limit)),
+        dtype=np.int64,
+    )
+    return indices[positions]
+
+
 def _pearson_numeric(x: np.ndarray, y: np.ndarray) -> float:
     mask = np.isfinite(x) & np.isfinite(y)
     if mask.sum() < 3:
@@ -115,8 +130,7 @@ def _correlation_with_target(
     if n_classes == 2:
         return _pearson_numeric(values, y.astype(np.float64))
     correlations = [
-        _pearson_numeric(values, (y == class_index).astype(np.float64))
-        for class_index in range(min(n_classes, 10))
+        _pearson_numeric(values, (y == class_index).astype(np.float64)) for class_index in range(min(n_classes, 10))
     ]
     finite = [abs(value) for value in correlations if np.isfinite(value)]
     return float(max(finite)) if finite else float("nan")
@@ -151,6 +165,7 @@ def compute_stats_and_filter(
     cfg: Dict[str, Any],
     logger: Any,
     heartbeat: Heartbeat,
+    temporal_windows: Optional[TemporalPSIWindows] = None,
 ) -> FilterResult:
     started = time.perf_counter()
     fcfg = cfg["filtering"]
@@ -168,6 +183,23 @@ def compute_stats_and_filter(
     columns = store.columns()
     report_rows: List[Dict[str, Any]] = []
     stats: Dict[str, Dict[str, Any]] = {}
+    if temporal_windows is not None:
+        if len(temporal_windows.reference_mask) != n_rows:
+            raise ValueError("Temporal PSI reference mask does not match cached rows.")
+        if len(temporal_windows.comparison_mask) != n_rows:
+            raise ValueError("Temporal PSI comparison mask does not match cached rows.")
+        psi_limit = int(fcfg["stats_sample_rows"]) if fcfg.get("stats_sample_rows") is not None else None
+        psi_reference_indices = _evenly_spaced_indices(
+            np.flatnonzero(temporal_windows.reference_mask),
+            psi_limit,
+        )
+        psi_comparison_indices = _evenly_spaced_indices(
+            np.flatnonzero(temporal_windows.comparison_mask),
+            psi_limit,
+        )
+    else:
+        psi_reference_indices = np.asarray([], dtype=np.int64)
+        psi_comparison_indices = np.asarray([], dtype=np.int64)
 
     logger.info(
         "[filter] computing stats for %s columns in blocks of %s (sample=%s rows)",
@@ -181,9 +213,7 @@ def compute_stats_and_filter(
         block_started = time.perf_counter()
         stats_limit = fcfg.get("stats_sample_rows")
         if stats_limit is not None and len(frame) > int(stats_limit):
-            sample_indices = np.linspace(
-                0, len(frame) - 1, int(stats_limit), dtype=np.int64
-            )
+            sample_indices = np.linspace(0, len(frame) - 1, int(stats_limit), dtype=np.int64)
             block_frame = frame.iloc[sample_indices].reset_index(drop=True)
             block_train_mask = train_mask[sample_indices]
             block_test_mask = test_mask[sample_indices]
@@ -193,6 +223,13 @@ def compute_stats_and_filter(
             block_train_mask = train_mask
             block_test_mask = test_mask
             block_y_train = y_train
+        temporal_reference_frame = frame.iloc[psi_reference_indices] if temporal_windows is not None else None
+        temporal_comparison_frame = frame.iloc[psi_comparison_indices] if temporal_windows is not None else None
+        temporal_reference_sample = (
+            frame.iloc[_evenly_spaced_indices(psi_reference_indices, sample_rows)]
+            if temporal_windows is not None
+            else None
+        )
         block_n_rows = len(block_frame)
         sample_frame = block_frame.iloc[: min(sample_rows, block_n_rows)]
         for column in block:
@@ -207,48 +244,80 @@ def compute_stats_and_filter(
             pearson = float("nan")
             iv_value = float("nan")
             psi_value = float("nan")
+            psi_reference_n = 0
+            psi_comparison_n = 0
             n_used_bins = 0
+            n_iv_bins = 0
             method = "none"
 
             if dtype in {"numeric", "datetime"}:
                 values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
-                sample_numeric = pd.to_numeric(sample_values, errors="coerce").to_numpy(
-                    dtype=np.float64
-                )
-                edges = _numeric_bin_edges(sample_numeric, int(fcfg.get("iv_bins", 10)))
-                bin_ids, n_used_bins = _numeric_bin_ids(values, edges)
-                pearson = _correlation_with_target(
-                    values[block_train_mask], block_y_train, n_classes
-                )
-                iv_value = _iv_for_bins(
-                    bin_ids[block_train_mask], block_y_train, n_used_bins, n_classes
-                )
-                if block_test_mask.any():
-                    ref_counts = np.bincount(
-                        bin_ids[block_train_mask], minlength=n_used_bins
+                sample_numeric = pd.to_numeric(sample_values, errors="coerce").to_numpy(dtype=np.float64)
+                if temporal_windows is not None:
+                    reference_values = pd.to_numeric(temporal_reference_frame[column], errors="coerce").to_numpy(
+                        dtype=np.float64
                     )
-                    cmp_counts = np.bincount(
-                        bin_ids[block_test_mask], minlength=n_used_bins
+                    comparison_values = pd.to_numeric(temporal_comparison_frame[column], errors="coerce").to_numpy(
+                        dtype=np.float64
                     )
+                    reference_sample_values = pd.to_numeric(
+                        temporal_reference_sample[column], errors="coerce"
+                    ).to_numpy(dtype=np.float64)
+                    edges = _numeric_bin_edges(
+                        reference_sample_values,
+                        int(fcfg.get("psi_bins", 10)),
+                    )
+                    reference_bins, n_used_bins = _numeric_bin_ids(reference_values, edges)
+                    comparison_bins, _ = _numeric_bin_ids(comparison_values, edges)
+                    psi_reference_n = len(reference_values)
+                    psi_comparison_n = len(comparison_values)
+                    ref_counts = np.bincount(reference_bins, minlength=n_used_bins)
+                    cmp_counts = np.bincount(comparison_bins, minlength=n_used_bins)
                     psi_value = _psi(ref_counts, cmp_counts)
-                method = "quantile_bins"
+                    iv_edges = _numeric_bin_edges(sample_numeric, int(fcfg.get("iv_bins", 10)))
+                    bin_ids, n_iv_bins = _numeric_bin_ids(values, iv_edges)
+                else:
+                    edges = _numeric_bin_edges(sample_numeric, int(fcfg.get("iv_bins", 10)))
+                    bin_ids, n_used_bins = _numeric_bin_ids(values, edges)
+                    n_iv_bins = n_used_bins
+                    psi_reference_n = int(block_train_mask.sum())
+                    psi_comparison_n = int(block_test_mask.sum())
+                    if block_test_mask.any():
+                        ref_counts = np.bincount(bin_ids[block_train_mask], minlength=n_used_bins)
+                        cmp_counts = np.bincount(bin_ids[block_test_mask], minlength=n_used_bins)
+                        psi_value = _psi(ref_counts, cmp_counts)
+                pearson = _correlation_with_target(values[block_train_mask], block_y_train, n_classes)
+                iv_value = _iv_for_bins(bin_ids[block_train_mask], block_y_train, n_iv_bins, n_classes)
+                method = "quantile_bins_temporal" if temporal_windows is not None else "quantile_bins"
             elif dtype in {"categorical", "identifier"}:
-                vocabulary = _categorical_vocabulary(
-                    sample_values, int(fcfg.get("categorical_top_k", 50))
-                )
-                bin_ids, n_used_bins = _categorical_bin_ids(series, vocabulary)
-                iv_value = _iv_for_bins(
-                    bin_ids[block_train_mask], block_y_train, n_used_bins, n_classes
-                )
-                if block_test_mask.any():
-                    ref_counts = np.bincount(
-                        bin_ids[block_train_mask], minlength=n_used_bins
+                if temporal_windows is not None:
+                    reference_values = temporal_reference_frame[column]
+                    comparison_values = temporal_comparison_frame[column]
+                    vocabulary = _categorical_vocabulary(
+                        temporal_reference_sample[column],
+                        int(fcfg.get("categorical_top_k", 50)),
                     )
-                    cmp_counts = np.bincount(
-                        bin_ids[block_test_mask], minlength=n_used_bins
-                    )
+                    reference_bins, n_used_bins = _categorical_bin_ids(reference_values, vocabulary)
+                    comparison_bins, _ = _categorical_bin_ids(comparison_values, vocabulary)
+                    psi_reference_n = len(reference_values)
+                    psi_comparison_n = len(comparison_values)
+                    ref_counts = np.bincount(reference_bins, minlength=n_used_bins)
+                    cmp_counts = np.bincount(comparison_bins, minlength=n_used_bins)
                     psi_value = _psi(ref_counts, cmp_counts)
-                method = "category_top_k"
+                    iv_vocabulary = _categorical_vocabulary(sample_values, int(fcfg.get("categorical_top_k", 50)))
+                    bin_ids, n_iv_bins = _categorical_bin_ids(series, iv_vocabulary)
+                else:
+                    vocabulary = _categorical_vocabulary(sample_values, int(fcfg.get("categorical_top_k", 50)))
+                    bin_ids, n_used_bins = _categorical_bin_ids(series, vocabulary)
+                    n_iv_bins = n_used_bins
+                    psi_reference_n = int(block_train_mask.sum())
+                    psi_comparison_n = int(block_test_mask.sum())
+                    if block_test_mask.any():
+                        ref_counts = np.bincount(bin_ids[block_train_mask], minlength=n_used_bins)
+                        cmp_counts = np.bincount(bin_ids[block_test_mask], minlength=n_used_bins)
+                        psi_value = _psi(ref_counts, cmp_counts)
+                iv_value = _iv_for_bins(bin_ids[block_train_mask], block_y_train, n_iv_bins, n_classes)
+                method = "category_top_k_temporal" if temporal_windows is not None else "category_top_k"
 
             row = {
                 "column": column,
@@ -260,7 +329,11 @@ def compute_stats_and_filter(
                 "abs_pearson": abs(pearson) if np.isfinite(pearson) else float("nan"),
                 "iv": iv_value,
                 "psi": psi_value,
+                "psi_mode": ("temporal" if temporal_windows is not None else "train_test"),
+                "psi_reference_n": psi_reference_n,
+                "psi_comparison_n": psi_comparison_n,
                 "bins": n_used_bins,
+                "iv_bins": n_iv_bins,
                 "binning": method,
             }
             report_rows.append(row)
@@ -281,7 +354,7 @@ def compute_stats_and_filter(
         )
 
     report = pd.DataFrame(report_rows)
-    keep_columns = set(str(column) for column in fcfg.get("keep_columns", []))
+    keep_columns = {str(column) for column in fcfg.get("keep_columns", [])}
     selected: List[str] = []
     reasons: Dict[str, str] = {}
 
@@ -299,14 +372,11 @@ def compute_stats_and_filter(
             fail_reasons.append("nan_ratio")
         if row["n_unique"] < int(fcfg.get("min_unique", 2)):
             fail_reasons.append("min_unique")
-        if dtype in {"categorical", "identifier"} and row["unique_ratio"] > float(
-            fcfg.get("max_unique_ratio", 0.98)
-        ):
+        if dtype in {"categorical", "identifier"} and row["unique_ratio"] > float(fcfg.get("max_unique_ratio", 0.98)):
             fail_reasons.append("unique_ratio")
         min_abs_pearson = float(fcfg.get("min_abs_pearson", 0.0))
-        if min_abs_pearson > 0 and np.isfinite(row["abs_pearson"]):
-            if row["abs_pearson"] < min_abs_pearson:
-                fail_reasons.append("pearson")
+        if min_abs_pearson > 0 and np.isfinite(row["abs_pearson"]) and row["abs_pearson"] < min_abs_pearson:
+            fail_reasons.append("pearson")
         min_iv = float(fcfg.get("min_iv", 0.0))
         if min_iv > 0 and np.isfinite(row["iv"]) and row["iv"] < min_iv:
             fail_reasons.append("iv")
@@ -351,12 +421,8 @@ def compute_stats_and_filter(
 
     report["selected"] = report["column"].map(lambda column: column in set(selected))
     report["reason"] = report["column"].map(lambda column: reasons.get(column, "not_evaluated"))
-    report["selection_score"] = report["column"].map(
-        lambda column: _selection_score(stats.get(str(column), {}))
-    )
-    report = report.sort_values(
-        ["selected", "selection_score"], ascending=[False, False]
-    ).reset_index(drop=True)
+    report["selection_score"] = report["column"].map(lambda column: _selection_score(stats.get(str(column), {})))
+    report = report.sort_values(["selected", "selection_score"], ascending=[False, False]).reset_index(drop=True)
 
     elapsed = time.perf_counter() - started
     logger.info(
@@ -393,11 +459,7 @@ def _deduplicate_correlated(
     sample_rows: int,
     logger: Any,
 ) -> Tuple[List[str], Dict[str, str]]:
-    numeric = [
-        column
-        for column in selected
-        if store.dtype(column) in {"numeric", "datetime"}
-    ]
+    numeric = [column for column in selected if store.dtype(column) in {"numeric", "datetime"}]
     if len(numeric) <= 1:
         return selected, {}
     sample = store.sample(numeric, n_rows=min(sample_rows, 5000))
@@ -414,11 +476,7 @@ def _deduplicate_correlated(
                 continue
         kept_numeric.append(column)
     kept_set = set(kept_numeric)
-    result = [
-        column
-        for column in selected
-        if store.dtype(column) not in {"numeric", "datetime"} or column in kept_set
-    ]
+    result = [column for column in selected if store.dtype(column) not in {"numeric", "datetime"} or column in kept_set]
     logger.info(
         "[filter] pairwise correlation > %.3f removed %s numeric columns",
         threshold,

@@ -41,6 +41,7 @@ from .schema import (
     save_json,
 )
 from .stats import compute_stats_and_filter
+from .temporal import load_temporal_psi_windows
 from .tuning import tune_and_train
 
 
@@ -186,6 +187,32 @@ class AutoMLPipeline:
                     np.savez(self.work_dir / "splits.npz", **splits)
                     stage.update({name: len(indices) for name, indices in splits.items()})
 
+                with self.recorder.stage(
+                    "temporal_psi_windows", "resolve temporal reference/comparison periods"
+                ) as stage:
+                    temporal_windows = load_temporal_psi_windows(
+                        self.cfg, label_info, self.logger
+                    )
+                    if temporal_windows is None:
+                        stage.update({"enabled": False, "psi_mode": "train_test"})
+                    else:
+                        np.savez(
+                            self.work_dir / "temporal_psi_windows.npz",
+                            reference_mask=temporal_windows.reference_mask,
+                            comparison_mask=temporal_windows.comparison_mask,
+                        )
+                        save_json(
+                            self.work_dir / "temporal_psi_windows.json",
+                            temporal_windows.metadata,
+                        )
+                        stage.update(
+                            {
+                                "enabled": True,
+                                "psi_mode": "temporal",
+                                **temporal_windows.metadata,
+                            }
+                        )
+
                 store = CacheStore(self.work_dir, manifest)
                 with self.recorder.stage("filtering_stats", "nan/nunique/pearson/IV/PSI") as stage:
                     filter_result = compute_stats_and_filter(
@@ -195,6 +222,7 @@ class AutoMLPipeline:
                         self.cfg,
                         self.logger,
                         self.heartbeat,
+                        temporal_windows=temporal_windows,
                     )
                     filter_result.report.to_csv(
                         self.work_dir / "filter_report.csv", index=False
@@ -206,12 +234,22 @@ class AutoMLPipeline:
                             "n_selected": len(filter_result.selected),
                             "n_total": len(filter_result.report),
                             "elapsed_seconds": filter_result.elapsed_seconds,
+                            "psi_mode": (
+                                "temporal"
+                                if temporal_windows is not None
+                                else "train_test"
+                            ),
                         },
                     )
                     stage.update(
                         {
                             "n_columns": len(filter_result.report),
                             "n_selected": len(filter_result.selected),
+                            "psi_mode": (
+                                "temporal"
+                                if temporal_windows is not None
+                                else "train_test"
+                            ),
                         }
                     )
 
@@ -327,6 +365,16 @@ class AutoMLPipeline:
                             "selected_columns": len(filter_result.selected),
                             "n_output_features": int(matrix.X.shape[1]),
                             "cache_bytes": manifest["total_cache_bytes"],
+                            "psi_mode": (
+                                "temporal"
+                                if temporal_windows is not None
+                                else "train_test"
+                            ),
+                            "temporal_psi": (
+                                temporal_windows.metadata
+                                if temporal_windows is not None
+                                else None
+                            ),
                         },
                         "tuning": {
                             "metric": tuning_result.metric,
@@ -347,6 +395,16 @@ class AutoMLPipeline:
                             "report_dir": str(self.report_dir),
                             "model": str(self.work_dir / "model" / "model.txt"),
                             "filter_report": str(self.work_dir / "filter_report.csv"),
+                            "temporal_psi_windows": (
+                                str(self.work_dir / "temporal_psi_windows.json")
+                                if temporal_windows is not None
+                                else None
+                            ),
+                            "temporal_psi_masks": (
+                                str(self.work_dir / "temporal_psi_windows.npz")
+                                if temporal_windows is not None
+                                else None
+                            ),
                             "predictions_test": str(
                                 self.report_dir / "predictions_test.csv"
                             ),
