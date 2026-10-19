@@ -1,0 +1,92 @@
+project:
+  name: stress_row_32k
+  work_dir: runs/stress_row_32k
+  random_seed: 42
+  log_level: INFO
+  heartbeat_seconds: 15
+
+data:
+  feature_paths:
+    - data/stress_row_32k/features_part_*.csv
+  label_path: data/stress_row_32k/labels.csv
+  feature_key: customer_id
+  label_key: customer_id
+  label_column: target
+  concat_mode: row
+  include_label_features: true
+  column_block_size: 32
+  max_source_columns_in_memory: 4000
+  wide_block_size: 4096
+  wide_row_group_size: 5000
+  cache_numeric_dtype: float32
+  ingest_target_chunk_bytes: 8589934592
+  sample_rows: 2000
+  csv:
+    sep: ","
+    encoding: utf-8
+    chunksize: 5000
+    na_values: ["", "NA", "NaN", "nan", "null", "None"]
+
+type_inference:
+  numeric_threshold: 0.95
+  detect_datetime: false
+  identifier_unique_ratio: 0.98
+  identifier_min_unique: 100
+
+filtering:
+  max_nan_ratio: 1.0
+  stats_sample_rows: 5000
+  min_unique: 2
+  max_unique_ratio: 0.99
+  min_abs_pearson: 0.0005
+  min_iv: 0.00001
+  max_psi: 1.0
+  max_features: 500
+  max_pairwise_corr: null
+  iv_bins: 10
+  categorical_top_k: 50
+  drop_identifiers: true
+  keep_columns: []
+
+preprocessing:
+  numeric_impute: median
+  categorical_impute: constant
+  categorical_constant: "__MISSING__"
+  add_missing_indicator: true
+  categorical_encoding: native
+  max_categories: 32
+  min_category_frequency: 2
+  clip_numeric: quantile
+  clip_quantiles: [0.001, 0.999]
+  max_output_features: 1000
+
+model:
+  name: lightgbm
+  search_space: search_spaces/lightgbm.yaml
+  num_boost_round: 1000
+  early_stopping_rounds: 50
+  seed: 42
+  num_threads: 0
+  log_period: 200
+
+tuning:
+  enabled: true
+  n_trials: 3
+  timeout_seconds: null
+  direction: auto
+  metric: auto
+  sampler:
+    n_startup_trials: 2
+    seed: 42
+  pruning: true
+  n_warmup_steps: 20
+  refit_on_train_valid: true
+
+metrics:
+  threshold: auto
+  plots: true
+  top_importance: 30
+
+output:
+  save_predictions: true
+  save_model: true

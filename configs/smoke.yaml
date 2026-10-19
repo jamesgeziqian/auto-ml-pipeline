@@ -1,0 +1,70 @@
+project:
+  name: smoke
+  work_dir: runs/smoke
+  random_seed: 7
+  log_level: INFO
+  heartbeat_seconds: 5
+
+data:
+  feature_paths:
+    - data/smoke/features_part_*.csv
+  label_path: data/smoke/labels.csv
+  feature_key: customer_id
+  label_key: customer_id
+  label_column: target
+  concat_mode: column
+  column_block_size: 16
+  sample_rows: 500
+  train_fraction: 0.7
+  valid_fraction: 0.15
+  test_fraction: 0.15
+  stratify: true
+  csv:
+    chunksize: 500
+    na_values: ["", "NA", "NaN", "nan", "null", "None"]
+
+filtering:
+  max_nan_ratio: 0.98
+  min_unique: 2
+  max_unique_ratio: 0.98
+  min_abs_pearson: 0.01
+  min_iv: 0.0001
+  max_psi: 1.0
+  max_features: 200
+  iv_bins: 8
+  categorical_top_k: 30
+  drop_identifiers: true
+
+preprocessing:
+  numeric_impute: median
+  categorical_impute: constant
+  categorical_constant: "__MISSING__"
+  add_missing_indicator: true
+  categorical_encoding: native
+  max_categories: 32
+  min_category_frequency: 2
+  clip_numeric: quantile
+  clip_quantiles: [0.01, 0.99]
+  max_output_features: 2000
+
+model:
+  name: lightgbm
+  search_space: search_spaces/lightgbm.yaml
+  num_boost_round: 300
+  early_stopping_rounds: 30
+  seed: 7
+  log_period: 50
+
+tuning:
+  enabled: true
+  n_trials: 3
+  sampler:
+    n_startup_trials: 1
+    seed: 7
+  pruning: false
+  refit_on_train_valid: true
+
+metrics:
+  threshold: auto
+  plots: true
+  top_importance: 20

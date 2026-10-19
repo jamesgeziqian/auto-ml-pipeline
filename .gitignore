@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Generated datasets and run artifacts can be several GB.
+data/
+runs/
+

@@ -1,0 +1,41 @@
+# Optuna TPE search space for the LightGBM adapter.
+# Edit this file (or point model.search_space at another file) to change tuning.
+fixed:
+  max_depth: -1
+  bagging_freq: 1
+  min_sum_hessian_in_leaf: 0.001
+
+parameters:
+  num_leaves:
+    type: int
+    low: 15
+    high: 255
+    log: true
+  learning_rate:
+    type: float
+    low: 0.01
+    high: 0.2
+    log: true
+  min_data_in_leaf:
+    type: int
+    low: 5
+    high: 120
+    log: true
+  feature_fraction:
+    type: float
+    low: 0.5
+    high: 1.0
+  bagging_fraction:
+    type: float
+    low: 0.6
+    high: 1.0
+  lambda_l1:
+    type: float
+    low: 0.00000001
+    high: 10.0
+    log: true
+  lambda_l2:
+    type: float
+    low: 0.00000001
+    high: 10.0
+    log: true

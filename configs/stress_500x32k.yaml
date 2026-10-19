@@ -1,0 +1,92 @@
+project:
+  name: stress_500x32k
+  work_dir: runs/stress_500x32k
+  random_seed: 42
+  log_level: INFO
+  heartbeat_seconds: 10
+
+data:
+  feature_paths:
+    - data/stress/features_part_*.csv
+  label_path: data/stress/labels.csv
+  feature_key: customer_id
+  label_key: customer_id
+  label_column: target
+  concat_mode: column
+  include_label_features: true
+  column_block_size: 32
+  max_source_columns_in_memory: 4000
+  sample_rows: 2000
+  train_fraction: 0.7
+  valid_fraction: 0.15
+  test_fraction: 0.15
+  stratify: true
+  csv:
+    sep: ","
+    encoding: utf-8
+    chunksize: 2000
+    na_values: ["", "NA", "NaN", "nan", "null", "None"]
+
+type_inference:
+  numeric_threshold: 0.95
+  detect_datetime: false
+  identifier_unique_ratio: 0.98
+  identifier_min_unique: 100
+
+filtering:
+  max_nan_ratio: 0.98
+  min_unique: 2
+  max_unique_ratio: 0.98
+  min_abs_pearson: 0.01
+  min_iv: 0.001
+  max_psi: 0.5
+  max_features: 500
+  max_pairwise_corr: 0.98
+  iv_bins: 10
+  psi_bins: 10
+  categorical_top_k: 50
+  drop_identifiers: true
+  keep_columns: []
+
+preprocessing:
+  numeric_impute: median
+  categorical_impute: constant
+  categorical_constant: "__MISSING__"
+  add_missing_indicator: true
+  categorical_encoding: native
+  max_categories: 64
+  min_category_frequency: 5
+  clip_numeric: quantile
+  clip_quantiles: [0.001, 0.999]
+  max_output_features: 5000
+
+model:
+  name: lightgbm
+  search_space: search_spaces/lightgbm.yaml
+  num_boost_round: 1500
+  early_stopping_rounds: 60
+  seed: 42
+  num_threads: 0
+  log_period: 200
+
+tuning:
+  enabled: true
+  n_trials: 15
+  timeout_seconds: null
+  direction: auto
+  metric: auto
+  sampler:
+    n_startup_trials: 8
+    seed: 42
+  pruning: true
+  n_warmup_steps: 20
+  refit_on_train_valid: true
+
+metrics:
+  threshold: auto
+  plots: true
+  top_importance: 30
+
+output:
+  save_predictions: true
+  save_model: true
