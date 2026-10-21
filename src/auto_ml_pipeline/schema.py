@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-from .config import ConfigError
+from .config import ConfigError, pandas_csv_options
 from .logging_utils import format_bytes
 
 NUMERIC_TYPES = {"numeric", "datetime"}
@@ -102,9 +102,11 @@ def _sanitize_id(text: str) -> str:
     return value or "source"
 
 
-def read_header(path: str | Path, sep: str = ",") -> List[str]:
+def read_header(path: str | Path, csv_cfg: Dict[str, Any]) -> List[str]:
     try:
-        header = pd.read_csv(path, sep=sep, nrows=0, low_memory=False)
+        header = pd.read_csv(
+            path, nrows=0, low_memory=False, **pandas_csv_options(csv_cfg)
+        )
     except Exception as exc:  # pragma: no cover - surfaced with a better message
         raise ConfigError(f"Unable to read CSV header from {path}: {exc}") from exc
     columns = [str(column) for column in header.columns]
@@ -125,12 +127,11 @@ def sample_csv(
     csv_cfg: Dict[str, Any],
     n_rows: Optional[int] = None,
 ) -> pd.DataFrame:
-    header = read_header(path, sep=csv_cfg.get("sep", ","))
+    header = read_header(path, csv_cfg)
     if n_rows is None:
         n_rows = _sample_nrows(len(header), 2000)
     frame = pd.read_csv(
         path,
-        sep=csv_cfg.get("sep", ","),
         encoding=csv_cfg.get("encoding", "utf-8"),
         compression=csv_cfg.get("compression", "infer"),
         nrows=n_rows,
@@ -138,6 +139,7 @@ def sample_csv(
         keep_default_na=True,
         na_values=csv_cfg.get("na_values"),
         low_memory=False,
+        **pandas_csv_options(csv_cfg),
     )
     frame.columns = [str(column) for column in frame.columns]
     return frame
@@ -220,7 +222,7 @@ def discover_sources(
 
     for index, path in enumerate(feature_paths):
         path_obj = Path(path)
-        header = read_header(path_obj, sep=csv_cfg.get("sep", ","))
+        header = read_header(path_obj, csv_cfg)
         is_label_source = path == label_path
         key_col = data["label_key"] if is_label_source else data["feature_key"]
         if key_col not in header:
@@ -387,7 +389,7 @@ def load_labels(cfg: Dict[str, Any], logger: Any) -> LabelInfo:
     path = data["label_path"]
     key_col = data["label_key"]
     label_col = data["label_column"]
-    header = read_header(path, sep=csv_cfg.get("sep", ","))
+    header = read_header(path, csv_cfg)
     if key_col not in header:
         raise ConfigError(f"Label key column {key_col!r} not found in {path}")
     if label_col not in header:
@@ -399,7 +401,6 @@ def load_labels(cfg: Dict[str, Any], logger: Any) -> LabelInfo:
     max_rows = data.get("max_rows")
     reader = pd.read_csv(
         path,
-        sep=csv_cfg.get("sep", ","),
         encoding=csv_cfg.get("encoding", "utf-8"),
         compression=csv_cfg.get("compression", "infer"),
         usecols=[key_col, label_col],
@@ -408,6 +409,7 @@ def load_labels(cfg: Dict[str, Any], logger: Any) -> LabelInfo:
         keep_default_na=True,
         na_values=csv_cfg.get("na_values"),
         low_memory=False,
+        **pandas_csv_options(csv_cfg),
     )
     for chunk_number, chunk in enumerate(reader, start=1):
         chunk.columns = [str(column) for column in chunk.columns]

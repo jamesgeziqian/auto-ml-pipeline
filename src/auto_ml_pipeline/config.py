@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import codecs
 import copy
+import csv as csv_module
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -50,6 +52,13 @@ DEFAULTS: Dict[str, Any] = {
             "sep": ",",
             "encoding": "utf-8",
             "chunksize": 2000,
+            "engine": "pandas",
+            "arrow_block_size": 67108864,
+            "arrow_use_threads": True,
+            "quoting": "minimal",
+            "quotechar": '"',
+            "doublequote": True,
+            "escapechar": None,
             "na_values": ["", "NA", "NaN", "nan", "null", "None"],
             "compression": "infer",
         },
@@ -182,6 +191,45 @@ def _resolve_input_path(path: Any, config_dir: Path) -> Optional[str]:
     return str(from_cwd)
 
 
+def csv_char(value: Any, default: Optional[str], name: str) -> Optional[str]:
+    """Resolve a one-character CSV option, accepting escapes such as ``\\x03``."""
+
+    if value is None:
+        return default
+    text = str(value)
+    if len(text) == 1:
+        return text
+    decoded = text
+    if text.startswith("\\"):
+        try:
+            decoded = codecs.decode(text, "unicode_escape")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ConfigError(f"{name} must be a single character; got {value!r}") from exc
+    if len(decoded) != 1:
+        raise ConfigError(f"{name} must be a single character; got {value!r}")
+    return decoded
+
+
+def pandas_csv_options(csv_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Shared pandas CSV keyword arguments for headers, samples, and ingest."""
+
+    quoting = str(csv_cfg.get("quoting", "minimal")).lower()
+    if quoting not in {"minimal", "none"}:
+        raise ConfigError("data.csv.quoting must be 'minimal' or 'none'.")
+    options: Dict[str, Any] = {
+        "sep": csv_char(csv_cfg.get("sep", ","), ",", "data.csv.sep"),
+        "doublequote": bool(csv_cfg.get("doublequote", True)),
+        "escapechar": csv_char(csv_cfg.get("escapechar"), None, "data.csv.escapechar"),
+    }
+    if quoting == "none":
+        options["quoting"] = csv_module.QUOTE_NONE
+        options["quotechar"] = None
+    else:
+        options["quoting"] = csv_module.QUOTE_MINIMAL
+        options["quotechar"] = csv_char(csv_cfg.get("quotechar", '"'), '"', "data.csv.quotechar")
+    return options
+
+
 def load_config(path: str | Path, overrides: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """Load a YAML config, merge defaults, apply dotted overrides, resolve paths."""
 
@@ -213,16 +261,12 @@ def load_config(path: str | Path, overrides: Optional[Iterable[str]] = None) -> 
     project = cfg["project"]
     project["work_dir"] = _resolve_path(project["work_dir"], Path.cwd())
     output = cfg["output"]
-    output["report_dir"] = _resolve_path(
-        output.get("report_dir") or (Path(project["work_dir"]) / "reports"), Path(".")
-    )
+    output["report_dir"] = _resolve_path(output.get("report_dir") or (Path(project["work_dir"]) / "reports"), Path("."))
 
     data = cfg["data"]
     data["label_path"] = _resolve_input_path(data.get("label_path"), config_dir)
     temporal_psi = cfg["filtering"]["temporal_psi"]
-    temporal_psi["time_path"] = _resolve_input_path(
-        temporal_psi.get("time_path"), config_dir
-    )
+    temporal_psi["time_path"] = _resolve_input_path(temporal_psi.get("time_path"), config_dir)
     expanded_paths: List[str] = []
     for entry in _as_list(data.get("feature_paths")):
         resolved = _resolve_input_path(entry, config_dir)
@@ -274,6 +318,13 @@ def validate_config(cfg: Dict[str, Any]) -> None:
 
     if data["concat_mode"] not in {"column", "row"}:
         raise ConfigError("data.concat_mode must be 'column' or 'row'.")
+    csv_engine = str(data.get("csv", {}).get("engine", "pandas")).lower()
+    if csv_engine not in {"pandas", "arrow"}:
+        raise ConfigError("data.csv.engine must be 'pandas' or 'arrow'.")
+    csv_chunksize = int(data.get("csv", {}).get("chunksize", 2000))
+    if csv_chunksize < 1:
+        raise ConfigError("data.csv.chunksize must be positive.")
+    pandas_csv_options(data.get("csv", {}))
     fractions = [
         float(data["train_fraction"]),
         float(data["valid_fraction"]),
@@ -305,29 +356,18 @@ def validate_config(cfg: Dict[str, Any]) -> None:
             "comparison_start",
             "comparison_end",
         ]
-        missing = [
-            key
-            for key in required
-            if temporal_psi.get(key) is None or temporal_psi.get(key) == ""
-        ]
+        missing = [key for key in required if temporal_psi.get(key) is None or temporal_psi.get(key) == ""]
         if missing:
-            raise ConfigError(
-                "filtering.temporal_psi is enabled but is missing: "
-                + ", ".join(missing)
-            )
+            raise ConfigError("filtering.temporal_psi is enabled but is missing: " + ", ".join(missing))
         time_path = temporal_psi.get("time_path") or data["label_path"]
         if not Path(time_path).exists():
             raise ConfigError(f"Temporal PSI time file does not exist: {time_path}")
         try:
             min_rows = int(temporal_psi.get("min_rows_per_period", 0))
         except (TypeError, ValueError) as exc:
-            raise ConfigError(
-                "filtering.temporal_psi.min_rows_per_period must be an integer."
-            ) from exc
+            raise ConfigError("filtering.temporal_psi.min_rows_per_period must be an integer.") from exc
         if min_rows < 1:
-            raise ConfigError(
-                "filtering.temporal_psi.min_rows_per_period must be positive."
-            )
+            raise ConfigError("filtering.temporal_psi.min_rows_per_period must be positive.")
 
 
 def config_to_yaml(cfg: Dict[str, Any]) -> str:

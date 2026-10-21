@@ -135,12 +135,42 @@ data:
   train_fraction: 0.7
   valid_fraction: 0.15
   test_fraction: 0.15
+  csv:
+    chunksize: 2000          # hard cap on rows per ingest chunk
+    engine: pandas           # pandas (default) or arrow
+    arrow_block_size: 67108864
+    arrow_use_threads: true
+    sep: ","                 # one character or an escape such as "\\x03"
+    quoting: minimal         # minimal (default) or none
+    quotechar: '"'
+    doublequote: true
+    escapechar: null
 ```
 
 `feature_paths` accepts paths and globs. Relative paths are resolved against the
 config directory first, then the current working directory. The label file may
 contain extra feature columns; they are included in the model unless
 `include_label_features` is false.
+
+`csv.engine: arrow` streams each file through `pyarrow.csv` and writes the
+column-blocked Parquet cache directly, without building a wide pandas frame.
+This is substantially faster and uses less memory on tables with thousands of
+columns, and it avoids the quadratic column-assignment path in pandas 1.x/2.0.
+It requires UTF-8 input and gzip/bz2/zstd/lz4/brotli compression; `.zip` and
+`.xz` files automatically fall back to the pandas engine. Numeric values are
+parsed directly at `cache_numeric_dtype`, so `float32` caches avoid a float64
+intermediate. Both engines produce the same cache schema and row coverage.
+
+For 32k-column files, keep `chunksize` at roughly 1,000–5,000 rows. The Arrow
+engine buffers `chunksize` rows across all retained columns, so memory is
+approximately `chunksize × columns × 8` bytes plus Parquet writer buffers.
+
+`sep` accepts a single character or a Python-style escape such as `"\\x03"`
+(ASCII ETX) or `"\\t"`. If the exporter never quotes fields — common with
+control-character delimiters — set `quoting: none`. A stray `"` is then kept as
+data instead of opening a quoted field that consumes the rest of the file, which
+is the usual cause of `EOF inside string`. Only disable quoting if the delimiter
+cannot occur inside a field; otherwise re-export with proper quoting.
 
 ### Column vs row concatenation
 

@@ -25,6 +25,7 @@ data:
     sep: ","
     encoding: utf-8
     chunksize: 5000
+    engine: arrow
     na_values: ["", "NA", "NaN", "nan", "null", "None"]
 
 type_inference:

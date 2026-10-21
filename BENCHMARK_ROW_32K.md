@@ -47,6 +47,13 @@ The CSV cache is **375,536,673 bytes (358 MiB)** after Zstandard compression,
 down from 12.81 GB of CSV. Filtering reduced **32,003 cached columns to 500**,
 and the final model matrix is **200,000 × 500 float32**.
 
+These timings were measured with the pandas CSV engine, which was the default
+when the benchmark was recorded. `configs/stress_row_32k.yaml` now sets
+`data.csv.engine: arrow`, which streams through `pyarrow.csv` and writes the
+blocked cache without building a wide pandas frame. It also avoids the
+quadratic column-assignment path in pandas 1.x/2.0. Re-running this benchmark
+with the Arrow engine is expected to produce a materially shorter ingest time.
+
 Filtering metrics were computed on a 5,000-row deterministic sample per column
 block (`filtering.stats_sample_rows: 5000`) to bound the 32k-column scan. The
 full 200,000 rows are used for the cache, preprocessing fit, matrix, and model.

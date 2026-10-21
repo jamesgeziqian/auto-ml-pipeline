@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 from auto_ml_pipeline.config import load_config
@@ -10,7 +11,8 @@ from auto_ml_pipeline.pipeline import run_pipeline
 from auto_ml_pipeline.synthetic import generate_wide_rowwise_dataset
 
 
-def test_wide_blocked_row_concat(tmp_path: Path) -> None:
+@pytest.mark.parametrize("engine", ["pandas", "arrow"])
+def test_wide_blocked_row_concat(tmp_path: Path, engine: str) -> None:
     data_dir = tmp_path / "wide"
     info = generate_wide_rowwise_dataset(
         data_dir,
@@ -46,6 +48,7 @@ def test_wide_blocked_row_concat(tmp_path: Path) -> None:
             "ingest_target_chunk_bytes": 8 * 1024 * 1024,
             "sample_rows": 200,
             "chunksize": 100,
+            "csv": {"engine": engine, "chunksize": 100},
             "train_fraction": 0.6,
             "valid_fraction": 0.2,
             "test_fraction": 0.2,
@@ -90,6 +93,7 @@ def test_wide_blocked_row_concat(tmp_path: Path) -> None:
     work_dir = Path(summary["work_dir"])
     manifest = json.loads((work_dir / "cache" / "manifest.json").read_text())
     assert manifest["n_rows"] == 500
+    assert manifest["csv_engine"] == engine
     feature_sources = [
         source
         for source in manifest["sources"].values()
@@ -97,6 +101,7 @@ def test_wide_blocked_row_concat(tmp_path: Path) -> None:
     ]
     assert len(feature_sources) == 2
     assert all(source["wide_blocked"] for source in feature_sources)
+    assert all(source["csv_engine"] == engine for source in feature_sources)
     assert all(len(source["part_groups"]) == 10 for source in feature_sources)
     matrix_meta = json.loads((work_dir / "matrix" / "matrix_meta.json").read_text())
     assert matrix_meta["shape"] == [500, 50]
