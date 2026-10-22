@@ -34,6 +34,7 @@ from .metrics import (
     select_binary_threshold,
 )
 from .preprocess import build_matrix, fit_preprocessing
+from .reuse import ReuseState
 from .schema import (
     discover_sources,
     load_labels,
@@ -51,6 +52,7 @@ class AutoMLPipeline:
         self.logger = configure_logging(cfg["project"].get("log_level", "INFO"))
         self.work_dir = self._prepare_work_dir()
         self._add_file_handler()
+        self.reuse = ReuseState(self.work_dir, self.cfg, self.logger)
         mpl_config = Path(self.work_dir).parent / ".matplotlib"
         mpl_config.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("MPLCONFIGDIR", str(mpl_config))
@@ -106,6 +108,7 @@ class AutoMLPipeline:
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "config_path": self.cfg.get("_meta", {}).get("config_path"),
             "work_dir": str(self.work_dir),
+            "reuse": self.reuse.as_dict(),
         }
         self.logger.info(
             "[setup] AutoML run starting: work_dir=%s pid=%s rss=%.1fMiB",
@@ -150,52 +153,118 @@ class AutoMLPipeline:
                         },
                     )
 
+                sources = None
+                schema_stats: Dict[str, Any] = {}
                 with self.recorder.stage("schema_inference", "sample and infer column types") as stage:
-                    sources, schema_stats = discover_sources(
-                        self.cfg, label_info, self.logger
-                    )
-                    stage.update(schema_stats)
-                    save_json(
-                        self.work_dir / "schema" / "sources.json",
-                        {
-                            "sources": [source.to_dict() for source in sources],
-                            "stats": schema_stats,
-                        },
-                    )
+                    if self.reuse.can_reuse("cache"):
+                        schema_stats = self.reuse.load_schema_stats()
+                        stage.update(
+                            {
+                                **schema_stats,
+                                "reused_from": str(self.reuse.source),
+                            }
+                        )
+                        self.logger.info(
+                            "[reuse] schema_inference from %s", self.reuse.source
+                        )
+                    else:
+                        sources, schema_stats = discover_sources(
+                            self.cfg, label_info, self.logger
+                        )
+                        stage.update(schema_stats)
+                        save_json(
+                            self.work_dir / "schema" / "sources.json",
+                            {
+                                "sources": [source.to_dict() for source in sources],
+                                "stats": schema_stats,
+                            },
+                        )
 
                 with self.recorder.stage("cache_ingest", "chunked CSV -> parquet cache") as stage:
-                    manifest = build_cache(
-                        self.cfg,
-                        sources,
-                        label_info,
-                        self.work_dir,
-                        self.logger,
-                        self.heartbeat,
-                    )
-                    stage.update(
-                        {
-                            "n_rows": manifest["n_rows"],
-                            "n_columns": manifest["n_logical_columns"],
-                            "cache_bytes": manifest["total_cache_bytes"],
-                            "missing_keys": manifest["total_missing_keys"],
-                            "coverage_ratio": manifest["coverage_ratio"],
-                        }
-                    )
+                    if self.reuse.can_reuse("cache"):
+                        manifest = self.reuse.load_manifest()
+                        stage.update(
+                            {
+                                "n_rows": manifest["n_rows"],
+                                "n_columns": manifest["n_logical_columns"],
+                                "cache_bytes": manifest["total_cache_bytes"],
+                                "missing_keys": manifest["total_missing_keys"],
+                                "coverage_ratio": manifest["coverage_ratio"],
+                                "reused_from": str(self.reuse.source),
+                            }
+                        )
+                        self.logger.info(
+                            "[reuse] cache_ingest from %s", self.reuse.source
+                        )
+                    else:
+                        if sources is None:
+                            raise RuntimeError(
+                                "Cache reuse was not available but source discovery "
+                                "was skipped."
+                            )
+                        manifest = build_cache(
+                            self.cfg,
+                            sources,
+                            label_info,
+                            self.work_dir,
+                            self.logger,
+                            self.heartbeat,
+                        )
+                        self.reuse.mark("cache")
+                        stage.update(
+                            {
+                                "n_rows": manifest["n_rows"],
+                                "n_columns": manifest["n_logical_columns"],
+                                "cache_bytes": manifest["total_cache_bytes"],
+                                "missing_keys": manifest["total_missing_keys"],
+                                "coverage_ratio": manifest["coverage_ratio"],
+                            }
+                        )
 
                 with self.recorder.stage("split", "stratified train/valid/test") as stage:
-                    splits = make_splits(label_info, self.cfg, self.logger)
-                    np.savez(self.work_dir / "splits.npz", **splits)
-                    stage.update({name: len(indices) for name, indices in splits.items()})
+                    if self.reuse.can_reuse("splits"):
+                        splits = self.reuse.load_splits()
+                        stage.update(
+                            {
+                                **{
+                                    name: len(indices)
+                                    for name, indices in splits.items()
+                                },
+                                "reused_from": str(self.reuse.source),
+                            }
+                        )
+                        self.logger.info("[reuse] split from %s", self.reuse.source)
+                    else:
+                        splits = make_splits(label_info, self.cfg, self.logger)
+                        np.savez(self.work_dir / "splits.npz", **splits)
+                        self.reuse.mark("splits")
+                        stage.update(
+                            {name: len(indices) for name, indices in splits.items()}
+                        )
 
                 with self.recorder.stage(
                     "temporal_psi_windows", "resolve temporal reference/comparison periods"
                 ) as stage:
-                    temporal_windows = load_temporal_psi_windows(
-                        self.cfg, label_info, self.logger
-                    )
+                    if self.reuse.can_reuse("temporal"):
+                        temporal_windows = self.reuse.load_temporal()
+                        stage.update(
+                            {
+                                "enabled": True,
+                                "psi_mode": "temporal",
+                                **temporal_windows.metadata,
+                                "reused_from": str(self.reuse.source),
+                            }
+                        )
+                        self.logger.info(
+                            "[reuse] temporal_psi_windows from %s", self.reuse.source
+                        )
+                    else:
+                        temporal_windows = load_temporal_psi_windows(
+                            self.cfg, label_info, self.logger
+                        )
                     if temporal_windows is None:
                         stage.update({"enabled": False, "psi_mode": "train_test"})
-                    else:
+                    elif not self.reuse.can_reuse("temporal"):
                         np.savez(
                             self.work_dir / "temporal_psi_windows.npz",
                             reference_mask=temporal_windows.reference_mask,
@@ -205,6 +274,7 @@ class AutoMLPipeline:
                             self.work_dir / "temporal_psi_windows.json",
                             temporal_windows.metadata,
                         )
+                        self.reuse.mark("temporal")
                         stage.update(
                             {
                                 "enabled": True,
@@ -215,80 +285,126 @@ class AutoMLPipeline:
 
                 store = CacheStore(self.work_dir, manifest)
                 with self.recorder.stage("filtering_stats", "nan/nunique/pearson/IV/PSI") as stage:
-                    filter_result = compute_stats_and_filter(
-                        store,
-                        label_info.y,
-                        splits,
-                        self.cfg,
-                        self.logger,
-                        self.heartbeat,
-                        temporal_windows=temporal_windows,
-                    )
-                    filter_result.report.to_csv(
-                        self.work_dir / "filter_report.csv", index=False
-                    )
-                    save_json(
-                        self.work_dir / "selected_features.json",
-                        {
-                            "selected": filter_result.selected,
-                            "n_selected": len(filter_result.selected),
-                            "n_total": len(filter_result.report),
-                            "elapsed_seconds": filter_result.elapsed_seconds,
-                            "psi_mode": (
-                                "temporal"
-                                if temporal_windows is not None
-                                else "train_test"
-                            ),
-                        },
-                    )
-                    stage.update(
-                        {
-                            "n_columns": len(filter_result.report),
-                            "n_selected": len(filter_result.selected),
-                            "psi_mode": (
-                                "temporal"
-                                if temporal_windows is not None
-                                else "train_test"
-                            ),
-                        }
-                    )
+                    if self.reuse.can_reuse("filtering"):
+                        filter_result = self.reuse.load_filter_result()
+                        stage.update(
+                            {
+                                "n_columns": len(filter_result.report),
+                                "n_selected": len(filter_result.selected),
+                                "psi_mode": (
+                                    "temporal"
+                                    if temporal_windows is not None
+                                    else "train_test"
+                                ),
+                                "reused_from": str(self.reuse.source),
+                            }
+                        )
+                        self.logger.info(
+                            "[reuse] filtering_stats from %s", self.reuse.source
+                        )
+                    else:
+                        filter_result = compute_stats_and_filter(
+                            store,
+                            label_info.y,
+                            splits,
+                            self.cfg,
+                            self.logger,
+                            self.heartbeat,
+                            temporal_windows=temporal_windows,
+                        )
+                        filter_result.report.to_csv(
+                            self.work_dir / "filter_report.csv", index=False
+                        )
+                        save_json(
+                            self.work_dir / "selected_features.json",
+                            {
+                                "selected": filter_result.selected,
+                                "n_selected": len(filter_result.selected),
+                                "n_total": len(filter_result.report),
+                                "elapsed_seconds": filter_result.elapsed_seconds,
+                                "psi_mode": (
+                                    "temporal"
+                                    if temporal_windows is not None
+                                    else "train_test"
+                                ),
+                            },
+                        )
+                        self.reuse.mark("filtering")
+                        stage.update(
+                            {
+                                "n_columns": len(filter_result.report),
+                                "n_selected": len(filter_result.selected),
+                                "psi_mode": (
+                                    "temporal"
+                                    if temporal_windows is not None
+                                    else "train_test"
+                                ),
+                            }
+                        )
 
                 with self.recorder.stage("preprocess_fit", "imputers and encoders") as stage:
-                    preprocess_state = fit_preprocessing(
-                        store,
-                        filter_result.selected,
-                        label_info.y,
-                        splits,
-                        self.cfg,
-                        self.logger,
-                        self.heartbeat,
-                    )
-                    save_json(
-                        self.work_dir / "preprocess_state.json", preprocess_state
-                    )
-                    stage.update(
-                        {
-                            "n_input_columns": len(preprocess_state["columns"]),
-                            "n_output_features": preprocess_state["n_output_features"],
-                            "encoding": preprocess_state["encoding"],
-                        }
-                    )
+                    if self.reuse.can_reuse("preprocessing"):
+                        preprocess_state = self.reuse.load_preprocess_state()
+                        stage.update(
+                            {
+                                "n_input_columns": len(preprocess_state["columns"]),
+                                "n_output_features": preprocess_state["n_output_features"],
+                                "encoding": preprocess_state["encoding"],
+                                "reused_from": str(self.reuse.source),
+                            }
+                        )
+                        self.logger.info(
+                            "[reuse] preprocess_fit from %s", self.reuse.source
+                        )
+                    else:
+                        preprocess_state = fit_preprocessing(
+                            store,
+                            filter_result.selected,
+                            label_info.y,
+                            splits,
+                            self.cfg,
+                            self.logger,
+                            self.heartbeat,
+                        )
+                        save_json(
+                            self.work_dir / "preprocess_state.json", preprocess_state
+                        )
+                        self.reuse.mark("preprocessing")
+                        stage.update(
+                            {
+                                "n_input_columns": len(preprocess_state["columns"]),
+                                "n_output_features": preprocess_state["n_output_features"],
+                                "encoding": preprocess_state["encoding"],
+                            }
+                        )
 
                 with self.recorder.stage("matrix_build", "materialize bounded model matrix") as stage:
-                    matrix = build_matrix(
-                        store,
-                        preprocess_state,
-                        label_info.y,
-                        self.work_dir,
-                        self.cfg,
-                        self.logger,
-                        self.heartbeat,
-                    )
+                    if self.reuse.can_reuse("matrix"):
+                        matrix = self.reuse.load_matrix(label_info.y)
+                        self.logger.info(
+                            "[reuse] matrix_build from %s", self.reuse.source
+                        )
+                    else:
+                        matrix = build_matrix(
+                            store,
+                            preprocess_state,
+                            label_info.y,
+                            self.work_dir,
+                            self.cfg,
+                            self.logger,
+                            self.heartbeat,
+                        )
+                        self.reuse.mark("matrix")
                     stage.update(
                         {
                             "n_rows": int(matrix.X.shape[0]),
                             "n_features": int(matrix.X.shape[1]),
                             "sparse": matrix.sparse,
+                            **(
+                                {"reused_from": str(self.reuse.source)}
+                                if self.reuse.can_reuse("matrix")
+                                else {}
+                            ),
                         }
                     )
 
@@ -428,6 +544,7 @@ class AutoMLPipeline:
         finally:
             self.recorder.log_table()
             summary["peak_rss_mb"] = round(peak_rss_mb(), 1)
+            summary["reuse"] = self.reuse.as_dict()
             save_json(self.work_dir / "run_summary.json", summary)
             pd.DataFrame(
                 [

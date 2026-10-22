@@ -24,6 +24,8 @@ DEFAULTS: Dict[str, Any] = {
         "log_level": "INFO",
         "heartbeat_seconds": 15,
         "overwrite": False,
+        "reuse_from": None,
+        "reuse_mode": "link",
     },
     "data": {
         "feature_paths": [],
@@ -260,6 +262,7 @@ def load_config(path: str | Path, overrides: Optional[Iterable[str]] = None) -> 
 
     project = cfg["project"]
     project["work_dir"] = _resolve_path(project["work_dir"], Path.cwd())
+    project["reuse_from"] = _resolve_path(project.get("reuse_from"), Path.cwd())
     output = cfg["output"]
     output["report_dir"] = _resolve_path(output.get("report_dir") or (Path(project["work_dir"]) / "reports"), Path("."))
 
@@ -346,6 +349,17 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ConfigError("tuning.n_trials must be >= 1 when tuning is enabled.")
     if float(project["heartbeat_seconds"]) <= 0:
         raise ConfigError("project.heartbeat_seconds must be positive.")
+    reuse_mode = str(project.get("reuse_mode", "link")).lower()
+    if reuse_mode not in {"link", "copy"}:
+        raise ConfigError("project.reuse_mode must be 'link' or 'copy'.")
+    reuse_from = project.get("reuse_from")
+    if reuse_from and not Path(reuse_from).is_dir():
+        raise ConfigError(f"project.reuse_from is not a directory: {reuse_from}")
+    if reuse_from and Path(reuse_from).resolve() == Path(project["work_dir"]).resolve():
+        raise ConfigError(
+            "project.reuse_from must point to a different run directory "
+            "than project.work_dir."
+        )
 
     temporal_psi = cfg["filtering"]["temporal_psi"]
     if temporal_psi.get("enabled"):

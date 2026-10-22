@@ -116,6 +116,51 @@ cells. It completed in 22.1 minutes with peak RSS of 4.34 GB; see
 [BENCHMARK_ROW_32K.md](BENCHMARK_ROW_32K.md). Delete `data/stress_row_32k` and
 the run's `cache/` and `matrix/` directories afterward to reclaim the space.
 
+## Reusing data artifacts across experiments
+
+When you only change model or tuning settings, reuse the data-side stages from
+an earlier run instead of rebuilding the cache, statistics, preprocessing, and
+matrix:
+
+```yaml
+project:
+  work_dir: runs/experiment_2
+  reuse_from: runs/experiment_1
+  reuse_mode: link        # link (default) or copy
+```
+
+`reuse_from` must point to a run created by this version of the pipeline. Every
+run writes `reuse_state.json`, recording a fingerprint and completion flag for
+each reusable stage. The pipeline reuses:
+
+- cache plus schema metadata
+- train/valid/test splits
+- temporal PSI masks, when enabled
+- filtering report and selected columns
+- preprocessing state
+- model matrix
+
+Fingerprints cover the relevant data, filtering, and preprocessing config, input
+file paths plus size/mtime, package versions, and the pipeline source files for
+those stages. Changing only `model` or `tuning` leaves every data-stage
+fingerprint unchanged.
+
+Reuse is stage-wise. If `filtering.max_features` changes, the cache and splits
+are still reused, while filtering, preprocessing, and the matrix are
+recomputed. If only `preprocessing.add_missing_indicator` changes, cache,
+splits, and filtering are reused. A change to an input CSV invalidates the cache
+and every stage derived from it.
+
+`reuse_mode: link` symlinks the cache and matrix directories and copies small
+metadata, split, and filter artifacts. Keep the source run directory as long as
+the new run uses it. `reuse_mode: copy` creates independent copies, at the cost
+of duplicating potentially multi-GB cache and matrix files.
+
+The mode also works as a resume mechanism: `reuse_from` may point to an
+interrupted run. Stages marked complete are reused; stages not yet completed are
+recomputed. `run_summary.json` and `stage_timings.csv` record which stages were
+reused and from where.
+
 ## Data configuration
 
 ```yaml
