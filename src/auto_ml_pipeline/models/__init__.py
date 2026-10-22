@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Type
 
-
 _ADAPTERS: Dict[str, Type[Any]] = {}
 
 
@@ -28,4 +27,7 @@ def available_models() -> list[str]:
     return sorted(_ADAPTERS)
 
 
-from . import lightgbm_adapter  # noqa: E402,F401  (register built-in adapters)
+from . import (
+    lightgbm_adapter,  # noqa: F401  (register built-in adapters)
+    xgboost_adapter,  # noqa: F401
+)

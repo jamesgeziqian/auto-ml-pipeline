@@ -12,6 +12,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import scipy.sparse as sp
+import xgboost as xgb
 import yaml
 from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score
 
@@ -92,6 +93,34 @@ class LightGBMPruningCallback:
                 if self.trial.should_prune():
                     raise optuna.TrialPruned()
                 break
+
+
+class XGBoostPruningCallback(xgb.callback.TrainingCallback):
+    """Report XGBoost validation metrics to Optuna after each boosting round."""
+
+    _METRIC_ALIASES = {  # noqa: RUF012
+        "multi_logloss": "mlogloss",
+        "binary_logloss": "logloss",
+    }
+
+    def __init__(self, trial: optuna.Trial, metric: str, valid_name: str = "valid"):
+        super().__init__()
+        self.trial = trial
+        self.metric = metric
+        self.valid_name = valid_name
+
+    def after_iteration(self, model: Any, epoch: int, evals_log: Dict[str, Any]) -> bool:
+        candidates = {self.metric, self._METRIC_ALIASES.get(self.metric, self.metric)}
+        for data_name, metrics in evals_log.items():
+            if data_name != self.valid_name:
+                continue
+            for metric_name, values in metrics.items():
+                if metric_name in candidates and values:
+                    self.trial.report(float(values[-1]), step=int(epoch))
+                    if self.trial.should_prune():
+                        raise optuna.TrialPruned()
+                    return False
+        return False
 
 
 def _validation_metric(
@@ -210,7 +239,15 @@ def tune_and_train(
             logger.info("[tune] trial %s start params=%s", trial.number, _short_params(params))
             callbacks = []
             if tuning_cfg.get("pruning", True):
-                callbacks.append(LightGBMPruningCallback(trial, metric))
+                if model_name == "lightgbm":
+                    callbacks.append(LightGBMPruningCallback(trial, metric))
+                elif model_name == "xgboost":
+                    callbacks.append(XGBoostPruningCallback(trial, metric))
+                else:
+                    logger.warning(
+                        "[tune] pruning is not implemented for model=%s; " "running without intermediate pruning",
+                        model_name,
+                    )
             adapter = make_adapter(params)
             adapter.fit(
                 X_train,
@@ -360,17 +397,13 @@ def tune_and_train(
         "best_params": best_params,
         "best_iteration": best_iteration,
         "n_trials_requested": int(tuning_cfg.get("n_trials", 20)) if study else 0,
-        "n_trials_run": int(len(study.trials)) if study else 0,
-        "n_trials_complete": int(
-            sum(trial.state == optuna.trial.TrialState.COMPLETE for trial in study.trials)
-        )
-        if study
-        else 0,
-        "n_trials_pruned": int(
-            sum(trial.state == optuna.trial.TrialState.PRUNED for trial in study.trials)
-        )
-        if study
-        else 0,
+        "n_trials_run": len(study.trials) if study else 0,
+        "n_trials_complete": (
+            int(sum(trial.state == optuna.trial.TrialState.COMPLETE for trial in study.trials)) if study else 0
+        ),
+        "n_trials_pruned": (
+            int(sum(trial.state == optuna.trial.TrialState.PRUNED for trial in study.trials)) if study else 0
+        ),
         "elapsed_seconds": round(elapsed, 4),
     }
     with (tuning_dir / "best_params.json").open("w", encoding="utf-8") as handle:
@@ -391,12 +424,19 @@ def tune_and_train(
 def _short_params(params: Dict[str, Any]) -> str:
     keys = [
         "num_leaves",
+        "max_depth",
         "learning_rate",
+        "eta",
         "min_data_in_leaf",
+        "min_child_weight",
         "feature_fraction",
+        "colsample_bytree",
         "bagging_fraction",
+        "subsample",
         "lambda_l1",
+        "alpha",
         "lambda_l2",
+        "reg_lambda",
     ]
     values = []
     for key in keys:

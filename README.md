@@ -2,8 +2,8 @@
 
 A chunked, configuration-driven auto machine learning pipeline for wide tabular
 data. It performs type inference, feature filtering, preprocessing, LightGBM
-training with Optuna TPE tuning, and metrics reporting without loading the full
-CSV dataset into memory.
+or XGBoost training with Optuna TPE tuning, and metrics reporting without
+loading the full CSV dataset into memory.
 
 The implementation follows `implementation_plan.md`.
 
@@ -24,7 +24,7 @@ The implementation follows `implementation_plan.md`.
 6. **Matrix build** – materialize only the selected columns into a dense float32
    memmap or a sparse CSR matrix.
 7. **Tuning and training** – Optuna TPE over a YAML search space, with an
-   interchangeable model-adapter layer. LightGBM is the built-in adapter.
+   interchangeable model-adapter layer. LightGBM and XGBoost are built in.
 8. **Evaluation and reports** – accuracy, precision, recall, F1, AUC, KS,
    log loss, Brier score, confusion matrix, feature importance, predictions,
    plots, and per-stage timings.
@@ -292,7 +292,7 @@ preprocessing:
   max_output_features: 5000
 ```
 
-`native` passes integer category codes to LightGBM's categorical feature
+`native` passes integer category codes to the selected tree model's categorical
 handling, avoiding an unbounded one-hot expansion. `onehot` builds a sparse CSR
 matrix; `ordinal` uses ordered integer codes.
 
@@ -332,6 +332,23 @@ parameters:
 Binary tasks optimize validation AUC by default; multiclass tasks optimize
 multiclass log loss. The final model is refit on train+valid, and the selection
 model remains available for an honest out-of-sample validation score.
+
+XGBoost is included as a second built-in adapter:
+
+```yaml
+model:
+  name: xgboost
+  search_space: search_spaces/xgboost.yaml
+  num_boost_round: 1000
+  early_stopping_rounds: 50
+  num_threads: 4
+```
+
+The XGBoost adapter uses `tree_method: hist`, maps `num_threads` to `nthread`,
+and uses `softprob` for multiclass probability output. Its search space tunes
+`max_depth`, `min_child_weight`, `eta`, `subsample`, `colsample_bytree`,
+`gamma`, `alpha`, and `reg_lambda`, with `max_depth` capped at 8 for cost
+control. XGBoost Optuna pruning is supported through its training-callback API.
 
 ### Adding a model adapter
 

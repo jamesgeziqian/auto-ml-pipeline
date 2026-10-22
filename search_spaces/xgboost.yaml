@@ -1,0 +1,45 @@
+# Optuna TPE search space for the XGBoost adapter.
+# Edit this file (or point model.search_space at another file) to change tuning.
+fixed:
+  tree_method: hist
+  max_bin: 128
+
+parameters:
+  max_depth:
+    type: int
+    low: 3
+    high: 8
+    step: 1
+  min_child_weight:
+    type: float
+    low: 0.1
+    high: 20.0
+    log: true
+  eta:
+    type: float
+    low: 0.03
+    high: 0.3
+    log: true
+  subsample:
+    type: float
+    low: 0.6
+    high: 1.0
+  colsample_bytree:
+    type: float
+    low: 0.5
+    high: 1.0
+  gamma:
+    type: float
+    low: 0.00000001
+    high: 10.0
+    log: true
+  alpha:
+    type: float
+    low: 0.00000001
+    high: 10.0
+    log: true
+  reg_lambda:
+    type: float
+    low: 0.00000001
+    high: 10.0
+    log: true
