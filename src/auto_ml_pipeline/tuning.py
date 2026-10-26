@@ -15,8 +15,10 @@ import scipy.sparse as sp
 import xgboost as xgb
 import yaml
 from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 
 from .logging_utils import Heartbeat
+from .metrics import ks_statistic
 from .models import create_adapter
 
 
@@ -133,6 +135,8 @@ def _validation_metric(
         positive = probabilities[:, 1]
         if metric == "auc":
             return float(roc_auc_score(y_true, positive))
+        if metric == "ks":
+            return float(ks_statistic(y_true, positive))
         if metric == "accuracy":
             return float(accuracy_score(y_true, (positive >= 0.5).astype(int)))
         if metric in {"f1", "f1_macro"}:
@@ -181,18 +185,27 @@ def tune_and_train(
     parameters = dict(space.get("parameters", {}))
     configured_params = dict(model_cfg.get("params", {}))
 
-    if task == "binary":
-        default_metric = "auc"
-        default_direction = "maximize"
-    else:
-        default_metric = "multi_logloss"
-        default_direction = "minimize"
+    default_metric = "auc" if task == "binary" else "multi_logloss"
     metric = tuning_cfg.get("metric", "auto")
     if metric in {None, "auto"}:
         metric = default_metric
     direction = tuning_cfg.get("direction", "auto")
     if direction in {None, "auto"}:
-        direction = "maximize" if metric in {"auc", "accuracy", "f1", "f1_macro", "f1_weighted"} else "minimize"
+        direction = (
+            "maximize"
+            if metric
+            in {
+                "auc",
+                "ks",
+                "accuracy",
+                "f1",
+                "f1_macro",
+                "f1_weighted",
+            }
+            else "minimize"
+        )
+    if metric == "ks" and task != "binary":
+        raise ValueError("tuning.metric='ks' is only supported for binary classification.")
 
     base_params = {
         **fixed,
@@ -202,6 +215,13 @@ def tune_and_train(
         "num_threads": int(model_cfg.get("num_threads", 0)),
     }
     num_boost_round = int(model_cfg.get("num_boost_round", 2000))
+
+    cv_cfg = tuning_cfg.get("cv") or {}
+    cv_enabled = False
+    cv_folds = 0
+    cv_seed = seed
+    cv_prune_after = 0
+    cv_splits: Optional[List[tuple[np.ndarray, np.ndarray]]] = None
 
     def make_adapter(params: Dict[str, Any]) -> Any:
         return create_adapter(
@@ -219,15 +239,47 @@ def tune_and_train(
     trials_rows: List[Dict[str, Any]] = []
 
     if tuning_cfg.get("enabled", True) and parameters:
+        cv_enabled = bool(cv_cfg.get("enabled", False))
+        if cv_enabled:
+            cv_folds = int(cv_cfg.get("folds", 5))
+            cv_seed_value = cv_cfg.get("seed")
+            cv_seed = int(cv_seed_value if cv_seed_value is not None else seed)
+            cv_prune_after = int(cv_cfg.get("prune_after_folds", 2))
+            class_counts = np.bincount(np.asarray(y_train).astype(int), minlength=n_classes)
+            if class_counts.min() < cv_folds:
+                raise ValueError(
+                    f"tuning.cv.folds={cv_folds} exceeds the smallest training "
+                    f"class count ({int(class_counts.min())})."
+                )
+            cv_prune_after = max(1, min(cv_prune_after, cv_folds))
+            splitter = StratifiedKFold(
+                n_splits=cv_folds,
+                shuffle=True,
+                random_state=cv_seed,
+            )
+            cv_splits = list(splitter.split(np.zeros(len(y_train), dtype=np.uint8), y_train))
+            logger.info(
+                "[tune] cross-validation enabled: folds=%s seed=%s " "prune_after_folds=%s",
+                cv_folds,
+                cv_seed,
+                cv_prune_after,
+            )
+        elif tuning_cfg.get("pruning", True) and metric == "ks":
+            logger.warning(
+                "[tune] metric=ks has no native model eval-log entry; "
+                "intermediate pruning is only available with tuning.cv"
+            )
+
         sampler_cfg = tuning_cfg.get("sampler", {})
         sampler = optuna.samplers.TPESampler(
             seed=int(sampler_cfg.get("seed", seed)),
             n_startup_trials=int(sampler_cfg.get("n_startup_trials", 10)),
         )
+        prune_warmup = cv_prune_after if cv_enabled else int(tuning_cfg.get("n_warmup_steps", 20))
         pruner = (
             optuna.pruners.MedianPruner(
                 n_startup_trials=int(sampler_cfg.get("n_startup_trials", 10)),
-                n_warmup_steps=int(tuning_cfg.get("n_warmup_steps", 20)),
+                n_warmup_steps=prune_warmup,
             )
             if tuning_cfg.get("pruning", True)
             else optuna.pruners.NopPruner()
@@ -237,36 +289,86 @@ def tune_and_train(
         def objective(trial: optuna.Trial) -> float:
             params = {**base_params, **suggest_params(trial, parameters)}
             logger.info("[tune] trial %s start params=%s", trial.number, _short_params(params))
-            callbacks = []
-            if tuning_cfg.get("pruning", True):
-                if model_name == "lightgbm":
-                    callbacks.append(LightGBMPruningCallback(trial, metric))
-                elif model_name == "xgboost":
-                    callbacks.append(XGBoostPruningCallback(trial, metric))
-                else:
-                    logger.warning(
-                        "[tune] pruning is not implemented for model=%s; " "running without intermediate pruning",
-                        model_name,
+            if cv_splits is not None:
+                fold_scores: List[float] = []
+                fold_iterations: List[int] = []
+                for fold_number, (train_index, valid_index) in enumerate(cv_splits, start=1):
+                    adapter = make_adapter(params)
+                    adapter.fit(
+                        X_train[train_index],
+                        y_train[train_index],
+                        X_train[valid_index],
+                        y_train[valid_index],
+                        num_boost_round=num_boost_round,
+                        callbacks=[],
                     )
-            adapter = make_adapter(params)
-            adapter.fit(
-                X_train,
-                y_train,
-                X_valid,
-                y_valid,
-                num_boost_round=num_boost_round,
-                callbacks=callbacks,
-            )
-            probabilities = adapter.predict_proba(X_valid)
-            score = _validation_metric(task, y_valid, probabilities, metric)
-            trial.set_user_attr("best_iteration", adapter.best_iteration)
+                    probabilities = adapter.predict_proba(X_train[valid_index])
+                    fold_score = _validation_metric(
+                        task,
+                        y_train[valid_index],
+                        probabilities,
+                        metric,
+                    )
+                    fold_scores.append(float(fold_score))
+                    fold_iterations.append(int(adapter.best_iteration))
+                    trial.set_user_attr("fold_scores", list(fold_scores))
+                    trial.set_user_attr("fold_best_iterations", list(fold_iterations))
+                    logger.info(
+                        "[tune] trial %s fold=%s/%s %s=%.6f " "best_iteration=%s",
+                        trial.number,
+                        fold_number,
+                        cv_folds,
+                        metric,
+                        fold_score,
+                        adapter.best_iteration,
+                    )
+                    if tuning_cfg.get("pruning", True):
+                        running = float(np.nanmean(fold_scores))
+                        if np.isfinite(running):
+                            trial.report(running, step=fold_number)
+                            if trial.should_prune():
+                                raise optuna.TrialPruned()
+                score = float(np.nanmean(fold_scores))
+                if not np.isfinite(score):
+                    raise ValueError(f"All CV folds produced a non-finite {metric} " f"for trial {trial.number}.")
+                valid_iterations = [value for value in fold_iterations if value > 0]
+                best_iteration_value = (
+                    round(float(np.median(valid_iterations))) if valid_iterations else num_boost_round
+                )
+                best_iteration_value = max(1, min(best_iteration_value, num_boost_round))
+            else:
+                callbacks = []
+                if tuning_cfg.get("pruning", True):
+                    if model_name == "lightgbm":
+                        callbacks.append(LightGBMPruningCallback(trial, metric))
+                    elif model_name == "xgboost":
+                        callbacks.append(XGBoostPruningCallback(trial, metric))
+                    else:
+                        logger.warning(
+                            "[tune] pruning is not implemented for model=%s; " "running without intermediate pruning",
+                            model_name,
+                        )
+                adapter = make_adapter(params)
+                adapter.fit(
+                    X_train,
+                    y_train,
+                    X_valid,
+                    y_valid,
+                    num_boost_round=num_boost_round,
+                    callbacks=callbacks,
+                )
+                probabilities = adapter.predict_proba(X_valid)
+                score = _validation_metric(task, y_valid, probabilities, metric)
+                best_iteration_value = int(adapter.best_iteration)
+
+            trial.set_user_attr("best_iteration", best_iteration_value)
             trial.set_user_attr("score", score)
             logger.info(
                 "[tune] trial %s done %s=%.6f best_iteration=%s",
                 trial.number,
                 metric,
                 score,
-                adapter.best_iteration,
+                best_iteration_value,
             )
             return score
 
@@ -282,6 +384,14 @@ def tune_and_train(
                     "value": trial.value,
                     "duration_seconds": round(duration, 3),
                     "best_iteration": trial.user_attrs.get("best_iteration"),
+                    "fold_scores": (
+                        json.dumps(trial.user_attrs.get("fold_scores")) if trial.user_attrs.get("fold_scores") else None
+                    ),
+                    "fold_best_iterations": (
+                        json.dumps(trial.user_attrs.get("fold_best_iterations"))
+                        if trial.user_attrs.get("fold_best_iterations")
+                        else None
+                    ),
                     "params": json.dumps(trial.params, sort_keys=True),
                 }
             )
@@ -303,12 +413,13 @@ def tune_and_train(
             )
 
         logger.info(
-            "[tune] starting TPE: model=%s trials=%s timeout=%ss direction=%s metric=%s",
+            "[tune] starting TPE: model=%s trials=%s timeout=%ss " "direction=%s metric=%s cv_folds=%s",
             model_name,
             tuning_cfg.get("n_trials"),
             tuning_cfg.get("timeout_seconds"),
             direction,
             metric,
+            cv_folds if cv_enabled else "off",
         )
         study.optimize(
             objective,
@@ -404,6 +515,10 @@ def tune_and_train(
         "n_trials_pruned": (
             int(sum(trial.state == optuna.trial.TrialState.PRUNED for trial in study.trials)) if study else 0
         ),
+        "cv_enabled": cv_enabled,
+        "cv_folds": cv_folds if cv_enabled else 0,
+        "cv_seed": cv_seed if cv_enabled else None,
+        "cv_prune_after_folds": cv_prune_after if cv_enabled else None,
         "elapsed_seconds": round(elapsed, 4),
     }
     with (tuning_dir / "best_params.json").open("w", encoding="utf-8") as handle:

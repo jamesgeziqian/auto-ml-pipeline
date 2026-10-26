@@ -193,7 +193,7 @@ def test_xgboost_tuning_pipeline(tmp_path: Path) -> None:
             "pruning": True,
             "n_warmup_steps": 1,
             "sampler": {"n_startup_trials": 1, "seed": 13},
-            "refit_on_train_valid": False,
+            "refit_on_train_valid": True,
         },
         "metrics": {"threshold": "auto", "plots": False},
     }

@@ -350,6 +350,22 @@ and uses `softprob` for multiclass probability output. Its search space tunes
 `gamma`, `alpha`, and `reg_lambda`, with `max_depth` capped at 8 for cost
 control. XGBoost Optuna pruning is supported through its training-callback API.
 
+For a pinned legacy XGBoost stack, use Python 3.10 and a separate environment:
+
+```bash
+uv venv .venv-legacy --python 3.10
+uv pip install \
+  --python .venv-legacy/bin/python \
+  -c constraints/legacy-xgboost.txt \
+  -e .
+```
+
+The legacy constraints pin `xgboost==1.5.2`, `pandas==2.0.3`, and
+`numpy<2`. XGBoost 1.5.2 predates NumPy 2 support, and `uv sync` uses the
+project’s modern lock rather than these constraints. The adapter uses
+`iteration_range`, `num_boosted_rounds`, categorical `DMatrix` options, and
+training callbacks, all of which are available in XGBoost 1.5.2.
+
 ### Adding a model adapter
 
 Implement `BaseModelAdapter` in `src/auto_ml_pipeline/models/base.py` and

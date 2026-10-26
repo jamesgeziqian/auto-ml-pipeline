@@ -101,14 +101,25 @@ class XGBoostAdapter(BaseModelAdapter):
         if sp.issparse(X):
             feature_types = None
             use_categorical = False
-        return xgb.DMatrix(
-            X,
-            label=None if label is None else np.asarray(label),
-            feature_names=self.feature_names,
-            feature_types=feature_types,
-            enable_categorical=bool(feature_types),
-            nthread=self._nthread,
-        )
+        kwargs: dict[str, Any] = {
+            "label": None if label is None else np.asarray(label),
+            "feature_names": self.feature_names,
+            "nthread": self._nthread,
+        }
+        if feature_types is not None:
+            kwargs["feature_types"] = feature_types
+            kwargs["enable_categorical"] = True
+        try:
+            return xgb.DMatrix(X, **kwargs)
+        except (TypeError, xgb.core.XGBoostError):
+            if feature_types is None:
+                raise
+            # Older XGBoost builds may expose categorical arguments but reject
+            # float-coded categories while constructing the DMatrix.
+            self._use_categorical = False
+            kwargs.pop("feature_types", None)
+            kwargs["enable_categorical"] = False
+            return xgb.DMatrix(X, **kwargs)
 
     def fit(
         self,
@@ -138,14 +149,21 @@ class XGBoostAdapter(BaseModelAdapter):
                         "valid",
                     )
                 )
+            train_kwargs: dict[str, Any] = {
+                # Pass an empty list rather than None: some XGBoost builds
+                # iterate evals unconditionally during no-validation refits.
+                "evals": evals,
+                "verbose_eval": False,
+                "callbacks": list(callbacks or []),
+            }
+            if self._early_stopped:
+                # Omit the keyword entirely when no valid set is available.
+                train_kwargs["early_stopping_rounds"] = early_stopping
             return xgb.train(
                 params,
                 train_matrix,
                 num_boost_round=int(num_boost_round),
-                evals=evals or None,
-                early_stopping_rounds=early_stopping if self._early_stopped else None,
-                verbose_eval=False,
-                callbacks=list(callbacks or []),
+                **train_kwargs,
             )
 
         try:

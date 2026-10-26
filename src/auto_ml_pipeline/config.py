@@ -132,6 +132,12 @@ DEFAULTS: Dict[str, Any] = {
         "timeout_seconds": None,
         "direction": "auto",
         "metric": "auto",
+        "cv": {
+            "enabled": False,
+            "folds": 5,
+            "seed": None,
+            "prune_after_folds": 2,
+        },
         "sampler": {"n_startup_trials": 10, "seed": 42},
         "pruning": True,
         "n_warmup_steps": 20,
@@ -347,6 +353,30 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ConfigError("preprocessing.categorical_encoding must be native, onehot, or ordinal.")
     if cfg["tuning"]["enabled"] and int(cfg["tuning"]["n_trials"]) < 1:
         raise ConfigError("tuning.n_trials must be >= 1 when tuning is enabled.")
+    cv = cfg["tuning"].get("cv") or {}
+    if not isinstance(cv, dict):
+        raise ConfigError("tuning.cv must be a mapping.")
+    if cfg["tuning"]["enabled"] and cv.get("enabled", False):
+        try:
+            folds = int(cv.get("folds", 5))
+            prune_after = int(cv.get("prune_after_folds", 2))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "tuning.cv.folds and tuning.cv.prune_after_folds must be integers."
+            ) from exc
+        if folds < 2:
+            raise ConfigError("tuning.cv.folds must be >= 2.")
+        if prune_after < 1 or prune_after > folds:
+            raise ConfigError(
+                "tuning.cv.prune_after_folds must be between 1 and "
+                "tuning.cv.folds."
+            )
+        cv_seed = cv.get("seed")
+        if cv_seed is not None:
+            try:
+                int(cv_seed)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError("tuning.cv.seed must be an integer or null.") from exc
     if float(project["heartbeat_seconds"]) <= 0:
         raise ConfigError("project.heartbeat_seconds must be positive.")
     reuse_mode = str(project.get("reuse_mode", "link")).lower()
