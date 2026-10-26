@@ -224,6 +224,13 @@ class AutoMLPipeline:
                 with self.recorder.stage("split", "stratified train/valid/test") as stage:
                     if self.reuse.can_reuse("splits"):
                         splits = self.reuse.load_splits()
+                        split_metadata_path = self.work_dir / "split_metadata.json"
+                        split_metadata = (
+                            json.loads(split_metadata_path.read_text(encoding="utf-8"))
+                            if split_metadata_path.exists()
+                            else {}
+                        )
+                        self.cfg.setdefault("_runtime", {})["split_metadata"] = split_metadata
                         stage.update(
                             {
                                 **{
@@ -231,15 +238,39 @@ class AutoMLPipeline:
                                     for name, indices in splits.items()
                                 },
                                 "reused_from": str(self.reuse.source),
+                                "strategy": split_metadata.get(
+                                    "strategy", "random"
+                                ),
+                                "evaluation_split": split_metadata.get(
+                                    "evaluation_split", "test"
+                                ),
                             }
                         )
                         self.logger.info("[reuse] split from %s", self.reuse.source)
                     else:
                         splits = make_splits(label_info, self.cfg, self.logger)
                         np.savez(self.work_dir / "splits.npz", **splits)
+                        split_metadata = self.cfg.get("_runtime", {}).get(
+                            "split_metadata", {}
+                        )
+                        save_json(
+                            self.work_dir / "split_metadata.json",
+                            split_metadata,
+                        )
                         self.reuse.mark("splits")
                         stage.update(
-                            {name: len(indices) for name, indices in splits.items()}
+                            {
+                                **{
+                                    name: len(indices)
+                                    for name, indices in splits.items()
+                                },
+                                "strategy": split_metadata.get(
+                                    "strategy", "random"
+                                ),
+                                "evaluation_split": split_metadata.get(
+                                    "evaluation_split", "test"
+                                ),
+                            }
                         )
 
                 with self.recorder.stage(
@@ -283,6 +314,15 @@ class AutoMLPipeline:
                             }
                         )
 
+                psi_mode = (
+                    "temporal"
+                    if temporal_windows is not None
+                    else (
+                        "train_valid"
+                        if "filter_test" in splits
+                        else "train_test"
+                    )
+                )
                 store = CacheStore(self.work_dir, manifest)
                 with self.recorder.stage("filtering_stats", "nan/nunique/pearson/IV/PSI") as stage:
                     if self.reuse.can_reuse("filtering"):
@@ -291,11 +331,7 @@ class AutoMLPipeline:
                             {
                                 "n_columns": len(filter_result.report),
                                 "n_selected": len(filter_result.selected),
-                                "psi_mode": (
-                                    "temporal"
-                                    if temporal_windows is not None
-                                    else "train_test"
-                                ),
+                                "psi_mode": psi_mode,
                                 "reused_from": str(self.reuse.source),
                             }
                         )
@@ -322,11 +358,7 @@ class AutoMLPipeline:
                                 "n_selected": len(filter_result.selected),
                                 "n_total": len(filter_result.report),
                                 "elapsed_seconds": filter_result.elapsed_seconds,
-                                "psi_mode": (
-                                    "temporal"
-                                    if temporal_windows is not None
-                                    else "train_test"
-                                ),
+                                "psi_mode": psi_mode,
                             },
                         )
                         self.reuse.mark("filtering")
@@ -334,11 +366,7 @@ class AutoMLPipeline:
                             {
                                 "n_columns": len(filter_result.report),
                                 "n_selected": len(filter_result.selected),
-                                "psi_mode": (
-                                    "temporal"
-                                    if temporal_windows is not None
-                                    else "train_test"
-                                ),
+                                "psi_mode": psi_mode,
                             }
                         )
 
@@ -456,6 +484,9 @@ class AutoMLPipeline:
                         splits,
                         matrix,
                     )
+                    metrics["evaluation"] = split_metadata
+                    if split_metadata.get("strategy") == "temporal":
+                        metrics["oot"] = metrics.get("test")
                     stage.update(
                         {
                             "primary_valid": metrics.get("primary_valid"),
@@ -481,11 +512,14 @@ class AutoMLPipeline:
                             "selected_columns": len(filter_result.selected),
                             "n_output_features": int(matrix.X.shape[1]),
                             "cache_bytes": manifest["total_cache_bytes"],
-                            "psi_mode": (
-                                "temporal"
-                                if temporal_windows is not None
-                                else "train_test"
+                            "psi_mode": psi_mode,
+                            "split_strategy": split_metadata.get(
+                                "strategy", "random"
                             ),
+                            "evaluation_split": split_metadata.get(
+                                "evaluation_split", "test"
+                            ),
+                            "split_metadata": split_metadata,
                             "temporal_psi": (
                                 temporal_windows.metadata
                                 if temporal_windows is not None
@@ -511,6 +545,9 @@ class AutoMLPipeline:
                             "report_dir": str(self.report_dir),
                             "model": str(self.work_dir / "model" / "model.txt"),
                             "filter_report": str(self.work_dir / "filter_report.csv"),
+                            "split_metadata": str(
+                                self.work_dir / "split_metadata.json"
+                            ),
                             "temporal_psi_windows": (
                                 str(self.work_dir / "temporal_psi_windows.json")
                                 if temporal_windows is not None
@@ -523,6 +560,11 @@ class AutoMLPipeline:
                             ),
                             "predictions_test": str(
                                 self.report_dir / "predictions_test.csv"
+                            ),
+                            "predictions_oot": (
+                                str(self.report_dir / "predictions_oot.csv")
+                                if split_metadata.get("strategy") == "temporal"
+                                else None
                             ),
                         },
                     }
@@ -694,6 +736,15 @@ class AutoMLPipeline:
         test_predictions.to_csv(
             self.report_dir / "predictions_test.csv", index=False
         )
+        if (
+            self.cfg.get("_runtime", {})
+            .get("split_metadata", {})
+            .get("strategy")
+            == "temporal"
+        ):
+            test_predictions.to_csv(
+                self.report_dir / "predictions_oot.csv", index=False
+            )
         save_metrics_json(self.report_dir / "metrics.json", metrics)
         if self.cfg["output"].get("save_model", True):
             model_path = self.work_dir / "model" / "model.txt"

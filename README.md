@@ -225,6 +225,45 @@ cannot occur inside a field; otherwise re-export with proper quoting.
 - `concat_mode: row` appends feature files vertically. All non-label feature
   files must have identical schemas.
 
+### Out-of-time split
+
+The label file can also provide a date column for an out-of-time holdout:
+
+```yaml
+data:
+  split_strategy: temporal
+  temporal_split:
+    time_column: as_of_date
+    date_format: "%Y-%m-%d"
+    timezone: Asia/Shanghai
+    oot_start: null          # explicit date wins when set
+    oot_quantile: 0.5        # used when oot_start is null
+    valid_fraction: 0.25     # latest portion of pre-cutoff rows
+    min_positive_count: null # nullable; applies to each split
+    max_positive_count: null # nullable; applies to each split
+```
+
+The split is:
+
+- `train`: earliest rows before the OOT cutoff
+- `valid`: latest `valid_fraction` of the pre-cutoff rows
+- `test` / `oot`: all rows at or after the cutoff
+
+The OOT period is used only for final evaluation. Filtering is restricted to
+train + valid, and PSI compares train with valid. Preprocessing and CV also use
+only pre-cutoff rows; the final model refits on train + valid. The time column
+is excluded from model features by default. `predictions_oot.csv`,
+`split_metadata.json`, and `metrics.json["evaluation"]` describe the OOT result.
+The old global train/valid/test fractions are used only by the random split.
+
+Changing the cutoff invalidates splits, filtering, preprocessing, and matrix,
+but the cache remains reusable. Changing the time column or split strategy
+invalidates the cache as well because it changes the feature set.
+
+If temporal PSI is enabled, its reference and comparison windows must end
+before the OOT cutoff; the pipeline rejects windows that would use OOT data for
+feature filtering.
+
 ## Filtering configuration
 
 ```yaml

@@ -177,9 +177,22 @@ def compute_stats_and_filter(
     train_mask = np.zeros(n_rows, dtype=bool)
     test_mask = np.zeros(n_rows, dtype=bool)
     train_mask[splits["train"]] = True
-    test_mask[splits["test"]] = True
-    y_train = y[train_mask]
-    y_test = y[test_mask]
+    filter_test_indices = splits.get("filter_test", splits["test"])
+    test_mask[filter_test_indices] = True
+    filter_indices = splits.get("filter_indices")
+    scope_indices = (
+        np.arange(n_rows, dtype=np.int64)
+        if filter_indices is None
+        else np.asarray(filter_indices, dtype=np.int64)
+    )
+    scope_train_mask = train_mask[scope_indices]
+    scope_test_mask = test_mask[scope_indices]
+    scope_y = np.asarray(y)[scope_indices]
+    psi_mode = (
+        "temporal"
+        if temporal_windows is not None
+        else ("train_valid" if "filter_test" in splits else "train_test")
+    )
     columns = store.columns()
     report_rows: List[Dict[str, Any]] = []
     stats: Dict[str, Dict[str, Any]] = {}
@@ -190,11 +203,11 @@ def compute_stats_and_filter(
             raise ValueError("Temporal PSI comparison mask does not match cached rows.")
         psi_limit = int(fcfg["stats_sample_rows"]) if fcfg.get("stats_sample_rows") is not None else None
         psi_reference_indices = _evenly_spaced_indices(
-            np.flatnonzero(temporal_windows.reference_mask),
+            np.flatnonzero(temporal_windows.reference_mask[scope_indices]),
             psi_limit,
         )
         psi_comparison_indices = _evenly_spaced_indices(
-            np.flatnonzero(temporal_windows.comparison_mask),
+            np.flatnonzero(temporal_windows.comparison_mask[scope_indices]),
             psi_limit,
         )
     else:
@@ -211,22 +224,37 @@ def compute_stats_and_filter(
         store.iter_column_blocks(columns=columns, block_size=block_size), start=1
     ):
         block_started = time.perf_counter()
+        scope_frame = (
+            frame if filter_indices is None else frame.iloc[scope_indices]
+        )
         stats_limit = fcfg.get("stats_sample_rows")
-        if stats_limit is not None and len(frame) > int(stats_limit):
-            sample_indices = np.linspace(0, len(frame) - 1, int(stats_limit), dtype=np.int64)
-            block_frame = frame.iloc[sample_indices].reset_index(drop=True)
-            block_train_mask = train_mask[sample_indices]
-            block_test_mask = test_mask[sample_indices]
-            block_y_train = y[sample_indices][block_train_mask]
+        if stats_limit is not None and len(scope_frame) > int(stats_limit):
+            sample_indices = np.linspace(
+                0, len(scope_frame) - 1, int(stats_limit), dtype=np.int64
+            )
+            block_frame = scope_frame.iloc[sample_indices].reset_index(drop=True)
+            block_train_mask = scope_train_mask[sample_indices]
+            block_test_mask = scope_test_mask[sample_indices]
+            block_y_train = scope_y[sample_indices][block_train_mask]
         else:
-            block_frame = frame
-            block_train_mask = train_mask
-            block_test_mask = test_mask
-            block_y_train = y_train
-        temporal_reference_frame = frame.iloc[psi_reference_indices] if temporal_windows is not None else None
-        temporal_comparison_frame = frame.iloc[psi_comparison_indices] if temporal_windows is not None else None
+            block_frame = scope_frame
+            block_train_mask = scope_train_mask
+            block_test_mask = scope_test_mask
+            block_y_train = scope_y[block_train_mask]
+        temporal_reference_frame = (
+            scope_frame.iloc[psi_reference_indices]
+            if temporal_windows is not None
+            else None
+        )
+        temporal_comparison_frame = (
+            scope_frame.iloc[psi_comparison_indices]
+            if temporal_windows is not None
+            else None
+        )
         temporal_reference_sample = (
-            frame.iloc[_evenly_spaced_indices(psi_reference_indices, sample_rows)]
+            scope_frame.iloc[
+                _evenly_spaced_indices(psi_reference_indices, sample_rows)
+            ]
             if temporal_windows is not None
             else None
         )
@@ -329,7 +357,7 @@ def compute_stats_and_filter(
                 "abs_pearson": abs(pearson) if np.isfinite(pearson) else float("nan"),
                 "iv": iv_value,
                 "psi": psi_value,
-                "psi_mode": ("temporal" if temporal_windows is not None else "train_test"),
+                "psi_mode": psi_mode,
                 "psi_reference_n": psi_reference_n,
                 "psi_comparison_n": psi_comparison_n,
                 "bins": n_used_bins,
@@ -416,6 +444,7 @@ def compute_stats_and_filter(
             float(max_pairwise),
             sample_rows,
             logger,
+            filter_indices=filter_indices,
         )
         reasons.update(pairwise_dropped)
 
@@ -458,11 +487,17 @@ def _deduplicate_correlated(
     threshold: float,
     sample_rows: int,
     logger: Any,
+    filter_indices: Optional[np.ndarray] = None,
 ) -> Tuple[List[str], Dict[str, str]]:
     numeric = [column for column in selected if store.dtype(column) in {"numeric", "datetime"}]
     if len(numeric) <= 1:
         return selected, {}
-    sample = store.sample(numeric, n_rows=min(sample_rows, 5000))
+    sample_limit = min(sample_rows, 5000)
+    if filter_indices is None:
+        sample = store.sample(numeric, n_rows=sample_limit)
+    else:
+        positions = _evenly_spaced_indices(filter_indices, sample_limit)
+        sample = store.read_columns(numeric).iloc[positions]
     sample = sample.apply(pd.to_numeric, errors="coerce")
     corr = sample.corr().abs()
     ordered = sorted(numeric, key=lambda column: _selection_score(stats[column]), reverse=True)

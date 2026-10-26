@@ -34,6 +34,17 @@ DEFAULTS: Dict[str, Any] = {
         "label_key": "id",
         "label_column": "target",
         "concat_mode": "column",
+        "split_strategy": "random",
+        "temporal_split": {
+            "time_column": None,
+            "date_format": None,
+            "timezone": None,
+            "oot_start": None,
+            "oot_quantile": 0.5,
+            "valid_fraction": 0.25,
+            "min_positive_count": None,
+            "max_positive_count": None,
+        },
         "include_label_features": True,
         "drop_columns": [],
         "deduplicate_columns": True,
@@ -327,6 +338,75 @@ def validate_config(cfg: Dict[str, Any]) -> None:
 
     if data["concat_mode"] not in {"column", "row"}:
         raise ConfigError("data.concat_mode must be 'column' or 'row'.")
+    split_strategy = str(data.get("split_strategy", "random")).lower()
+    if split_strategy not in {"random", "temporal"}:
+        raise ConfigError("data.split_strategy must be 'random' or 'temporal'.")
+    if split_strategy == "temporal":
+        temporal_split = data.get("temporal_split") or {}
+        if not isinstance(temporal_split, dict):
+            raise ConfigError("data.temporal_split must be a mapping.")
+        if not temporal_split.get("time_column"):
+            raise ConfigError(
+                "data.temporal_split.time_column is required when "
+                "split_strategy is 'temporal'."
+            )
+        time_column = str(temporal_split["time_column"])
+        if time_column in {str(data["label_column"]), str(data["label_key"])}:
+            raise ConfigError(
+                "data.temporal_split.time_column must be a separate date column, "
+                "not the label or key column."
+            )
+        valid_fraction = float(temporal_split.get("valid_fraction", 0.25))
+        if not 0.0 < valid_fraction < 1.0:
+            raise ConfigError(
+                "data.temporal_split.valid_fraction must be between 0 and 1."
+            )
+        if (
+            temporal_split.get("oot_start") is None
+            and temporal_split.get("oot_quantile") is None
+        ):
+            raise ConfigError(
+                "data.temporal_split requires either oot_start or oot_quantile."
+            )
+        oot_quantile = temporal_split.get("oot_quantile", 0.5)
+        if oot_quantile is not None:
+            try:
+                oot_quantile = float(oot_quantile)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(
+                    "data.temporal_split.oot_quantile must be a number or null."
+                ) from exc
+            if not 0.0 < oot_quantile < 1.0:
+                raise ConfigError(
+                    "data.temporal_split.oot_quantile must be strictly between 0 and 1."
+                )
+        min_positive = temporal_split.get("min_positive_count")
+        max_positive = temporal_split.get("max_positive_count")
+        try:
+            min_positive = None if min_positive is None else int(min_positive)
+            max_positive = None if max_positive is None else int(max_positive)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "data.temporal_split positive count limits must be integers "
+                "or null."
+            ) from exc
+        if min_positive is not None and min_positive < 0:
+            raise ConfigError(
+                "data.temporal_split.min_positive_count must be >= 0 or null."
+            )
+        if max_positive is not None and max_positive < 0:
+            raise ConfigError(
+                "data.temporal_split.max_positive_count must be >= 0 or null."
+            )
+        if (
+            min_positive is not None
+            and max_positive is not None
+            and min_positive > max_positive
+        ):
+            raise ConfigError(
+                "data.temporal_split.min_positive_count must not exceed "
+                "data.temporal_split.max_positive_count."
+            )
     csv_engine = str(data.get("csv", {}).get("engine", "pandas")).lower()
     if csv_engine not in {"pandas", "arrow"}:
         raise ConfigError("data.csv.engine must be 'pandas' or 'arrow'.")
@@ -334,15 +414,16 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     if csv_chunksize < 1:
         raise ConfigError("data.csv.chunksize must be positive.")
     pandas_csv_options(data.get("csv", {}))
-    fractions = [
-        float(data["train_fraction"]),
-        float(data["valid_fraction"]),
-        float(data["test_fraction"]),
-    ]
-    if any(value <= 0 for value in fractions):
-        raise ConfigError("train/valid/test fractions must all be positive.")
-    if abs(sum(fractions) - 1.0) > 1e-6:
-        raise ConfigError("data train/valid/test fractions must sum to 1.0.")
+    if split_strategy == "random":
+        fractions = [
+            float(data["train_fraction"]),
+            float(data["valid_fraction"]),
+            float(data["test_fraction"]),
+        ]
+        if any(value <= 0 for value in fractions):
+            raise ConfigError("train/valid/test fractions must all be positive.")
+        if abs(sum(fractions) - 1.0) > 1e-6:
+            raise ConfigError("data train/valid/test fractions must sum to 1.0.")
 
     pre = cfg["preprocessing"]
     if pre["numeric_impute"] not in {"median", "mean", "zero", "constant"}:

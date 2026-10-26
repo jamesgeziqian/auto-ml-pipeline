@@ -215,6 +215,12 @@ def discover_sources(
         feature_paths.append(label_path)
 
     drop_columns = {str(column) for column in data.get("drop_columns", [])}
+    split_strategy = str(data.get("split_strategy", "random")).lower()
+    split_time_column = (
+        str((data.get("temporal_split") or {}).get("time_column") or "")
+        if split_strategy == "temporal"
+        else None
+    )
     used_ids: Dict[str, int] = {}
     sources: List[SourceSpec] = []
     total_sample_bytes = 0.0
@@ -230,6 +236,15 @@ def discover_sources(
         label_col = data["label_column"] if is_label_source else None
         if is_label_source and label_col not in header:
             raise ConfigError(f"Label column {label_col!r} not found in {path}")
+        if (
+            is_label_source
+            and split_time_column
+            and split_time_column not in header
+        ):
+            raise ConfigError(
+                f"Temporal split time column {split_time_column!r} "
+                f"not found in {path}"
+            )
 
         base_id = _sanitize_id(path_obj.stem)
         if base_id in used_ids:
@@ -269,6 +284,9 @@ def discover_sources(
 
         for column in header:
             if column == key_col or column == label_col:
+                continue
+            if split_time_column and column == split_time_column:
+                spec.dropped_columns[column] = "temporal split time column"
                 continue
             if column in drop_columns:
                 spec.dropped_columns[column] = "configured drop"
@@ -501,12 +519,313 @@ def _is_number(value: Any) -> bool:
         return False
 
 
+def _load_label_timestamps(
+    label_info: LabelInfo,
+    cfg: Dict[str, Any],
+) -> pd.DatetimeIndex:
+    data = cfg["data"]
+    tcfg = data.get("temporal_split") or {}
+    csv_cfg = data["csv"]
+    path = data["label_path"]
+    key_col = data["label_key"]
+    time_col = str(tcfg["time_column"])
+    try:
+        frame = pd.read_csv(
+            path,
+            usecols=[key_col, time_col],
+            dtype=str,
+            keep_default_na=True,
+            na_values=csv_cfg.get("na_values"),
+            low_memory=False,
+            **pandas_csv_options(csv_cfg),
+        )
+    except Exception as exc:
+        raise ConfigError(
+            f"Unable to read temporal split columns {key_col!r}, "
+            f"{time_col!r} from {path}: {exc}"
+        ) from exc
+    frame.columns = [str(column) for column in frame.columns]
+    keys = frame[key_col].astype("string").str.strip()
+    null_keys = keys.isna() | (keys == "")
+    if null_keys.any():
+        raise ConfigError(
+            f"Label file contains {int(null_keys.sum())} rows with an empty "
+            f"{key_col!r} key while loading temporal splits."
+        )
+
+    label_index = pd.Index(label_info.keys)
+    positions = label_index.get_indexer(pd.Index(keys.astype(str), dtype=object))
+    matched_positions = positions[positions >= 0]
+    if pd.Series(matched_positions).duplicated(keep=False).any():
+        examples = keys[positions >= 0][
+            pd.Series(matched_positions).duplicated(keep=False).to_numpy()
+        ].tolist()[:5]
+        raise ConfigError(
+            f"Label file contains duplicate keys while loading temporal splits "
+            f"(sample: {examples})."
+        )
+
+    values = np.empty(label_info.n_rows, dtype=object)
+    filled = np.zeros(label_info.n_rows, dtype=bool)
+    matched = positions >= 0
+    values[positions[matched]] = frame.loc[matched, time_col].astype("string").to_numpy(
+        dtype=object
+    )
+    filled[positions[matched]] = True
+    missing = ~filled
+    if missing.any():
+        examples = label_index[missing].tolist()[:5]
+        raise ConfigError(
+            f"{int(missing.sum())} label keys have no temporal split timestamp "
+            f"(sample: {examples})."
+        )
+
+    from .temporal import _parse_timestamp_values
+
+    timestamps = _parse_timestamp_values(
+        values,
+        tcfg.get("date_format"),
+        tcfg.get("timezone"),
+    )
+    invalid = timestamps.isna()
+    if invalid.any():
+        examples = label_index[invalid].tolist()[:5]
+        raise ConfigError(
+            f"{int(invalid.sum())} temporal split timestamps could not be parsed "
+            f"(sample keys: {examples})."
+        )
+    return timestamps
+
+
+def _split_metadata_for_indices(
+    timestamps: Optional[pd.DatetimeIndex],
+    y: np.ndarray,
+    indices: np.ndarray,
+) -> Dict[str, Any]:
+    labels = np.asarray(y)[indices]
+    positives = int(labels.sum())
+    n_rows = int(len(indices))
+    subset = timestamps[indices] if timestamps is not None else None
+    return {
+        "n": n_rows,
+        "n_positive": positives,
+        "n_negative": n_rows - positives,
+        "date_min": (
+            subset.min().isoformat() if subset is not None and n_rows else None
+        ),
+        "date_max": (
+            subset.max().isoformat() if subset is not None and n_rows else None
+        ),
+    }
+
+
+def _validate_temporal_positive_counts(
+    name: str,
+    indices: np.ndarray,
+    y: np.ndarray,
+    min_positive: Optional[int],
+    max_positive: Optional[int],
+) -> None:
+    positives = int(np.asarray(y)[indices].sum())
+    n_negative = int(len(indices) - positives)
+    if positives == 0 or n_negative == 0:
+        raise ConfigError(
+            f"Temporal split {name!r} has only one class "
+            f"(positive={positives}, negative={n_negative}); "
+            "AUC and KS cannot be computed."
+        )
+    if min_positive is not None and positives < min_positive:
+        raise ConfigError(
+            f"Temporal split {name!r} has {positives} positive rows, below "
+            f"data.temporal_split.min_positive_count={min_positive}."
+        )
+    if max_positive is not None and positives > max_positive:
+        raise ConfigError(
+            f"Temporal split {name!r} has {positives} positive rows, above "
+            f"data.temporal_split.max_positive_count={max_positive}."
+        )
+
+
+def _make_temporal_splits(
+    label_info: LabelInfo,
+    cfg: Dict[str, Any],
+    logger: Any,
+) -> Dict[str, np.ndarray]:
+    data = cfg["data"]
+    tcfg = data.get("temporal_split") or {}
+    timestamps = _load_label_timestamps(label_info, cfg)
+    timestamp_ns = timestamps.asi8
+    if tcfg.get("oot_start") is not None:
+        from .temporal import _parse_boundary
+
+        cutoff = _parse_boundary(
+            tcfg["oot_start"],
+            tcfg.get("timezone"),
+            "oot_start",
+        )
+        cutoff_ns = int(cutoff.value)
+        cutoff_source = "explicit"
+        oot_quantile = None
+    else:
+        oot_quantile = float(tcfg.get("oot_quantile", 0.5))
+        cutoff_ns = int(np.quantile(timestamp_ns, oot_quantile))
+        cutoff = pd.Timestamp(cutoff_ns, unit="ns", tz="UTC")
+        cutoff_source = f"quantile:{oot_quantile}"
+
+    pre_mask = timestamp_ns < cutoff_ns
+    oot_mask = timestamp_ns >= cutoff_ns
+    if not pre_mask.any() or not oot_mask.any():
+        raise ConfigError(
+            "Temporal split produced an empty pre-cutoff or OOT period. "
+            "Adjust data.temporal_split.oot_start or oot_quantile."
+        )
+
+    valid_fraction = float(tcfg.get("valid_fraction", 0.25))
+    pre_times = timestamp_ns[pre_mask]
+    target_valid_rows = max(
+        1,
+        min(
+            int(pre_mask.sum()) - 1,
+            int(np.floor(valid_fraction * int(pre_mask.sum()))),
+        ),
+    )
+    unique_pre_times = np.unique(pre_times)
+    candidate_index = max(
+        0,
+        min(
+            len(unique_pre_times) - 1,
+            int(np.searchsorted(
+                unique_pre_times,
+                np.sort(pre_times)[-target_valid_rows],
+                side="left",
+            )),
+        ),
+    )
+    valid_start_ns = int(unique_pre_times[candidate_index])
+    while (
+        candidate_index + 1 < len(unique_pre_times)
+        and int(np.count_nonzero(pre_times >= valid_start_ns)) > target_valid_rows
+    ):
+        candidate_index += 1
+        valid_start_ns = int(unique_pre_times[candidate_index])
+    valid_mask = pre_mask & (timestamp_ns >= valid_start_ns)
+    train_mask = pre_mask & (timestamp_ns < valid_start_ns)
+    if not train_mask.any() or not valid_mask.any():
+        raise ConfigError(
+            "Temporal validation split is empty. Reduce "
+            "data.temporal_split.valid_fraction or check the date distribution."
+        )
+
+    train_idx = np.sort(np.flatnonzero(train_mask).astype(np.int64))
+    valid_idx = np.sort(np.flatnonzero(valid_mask).astype(np.int64))
+    oot_idx = np.sort(np.flatnonzero(oot_mask).astype(np.int64))
+    min_positive = tcfg.get("min_positive_count")
+    max_positive = tcfg.get("max_positive_count")
+    for name, indices in (
+        ("train", train_idx),
+        ("valid", valid_idx),
+        ("oot", oot_idx),
+    ):
+        _validate_temporal_positive_counts(
+            name,
+            indices,
+            label_info.y,
+            None if min_positive is None else int(min_positive),
+            None if max_positive is None else int(max_positive),
+        )
+
+    temporal_psi = cfg["filtering"].get("temporal_psi") or {}
+    if temporal_psi.get("enabled"):
+        from .temporal import _parse_boundary
+
+        for key in (
+            "reference_start",
+            "reference_end",
+            "comparison_start",
+            "comparison_end",
+        ):
+            boundary = _parse_boundary(
+                temporal_psi[key],
+                temporal_psi.get("timezone"),
+                key,
+            )
+            if boundary.value > cutoff_ns or (
+                key.endswith("_start") and boundary.value >= cutoff_ns
+            ):
+                raise ConfigError(
+                    "filtering.temporal_psi windows must remain within the "
+                    "pre-cutoff period so OOT data is not used for feature filtering."
+                )
+
+    actual_valid_fraction = float(len(valid_idx) / max(1, int(pre_mask.sum())))
+    if not 0.2 <= actual_valid_fraction <= 0.3:
+        logger.warning(
+            "[split] temporal valid fraction is %.3f (requested %.3f); "
+            "date ties can move the boundary",
+            actual_valid_fraction,
+            valid_fraction,
+        )
+
+    metadata = {
+        "strategy": "temporal",
+        "evaluation_split": "oot",
+        "time_column": tcfg.get("time_column"),
+        "timezone": tcfg.get("timezone"),
+        "date_format": tcfg.get("date_format"),
+        "oot_start": cutoff.isoformat(),
+        "oot_cutoff_source": cutoff_source,
+        "oot_quantile": oot_quantile,
+        "valid_start": pd.Timestamp(
+            valid_start_ns, unit="ns", tz="UTC"
+        ).isoformat(),
+        "valid_fraction_requested": valid_fraction,
+        "valid_fraction_actual": actual_valid_fraction,
+        "positive_count_limits": {
+            "min": min_positive,
+            "max": max_positive,
+        },
+        "splits": {
+            "train": _split_metadata_for_indices(
+                timestamps, label_info.y, train_idx
+            ),
+            "valid": _split_metadata_for_indices(
+                timestamps, label_info.y, valid_idx
+            ),
+            "oot": _split_metadata_for_indices(
+                timestamps, label_info.y, oot_idx
+            ),
+        },
+    }
+    cfg.setdefault("_runtime", {})["split_metadata"] = metadata
+    logger.info(
+        "[split] temporal train=%s valid=%s oot=%s (cutoff=%s, valid_start=%s, source=%s, seed=%s)",
+        len(train_idx),
+        len(valid_idx),
+        len(oot_idx),
+        metadata["oot_start"],
+        metadata["valid_start"],
+        cutoff_source,
+        cfg["project"]["random_seed"],
+    )
+    return {
+        "train": train_idx,
+        "valid": valid_idx,
+        "test": oot_idx,
+        "filter_test": valid_idx,
+        "filter_indices": np.sort(
+            np.concatenate([train_idx, valid_idx]).astype(np.int64)
+        ),
+    }
+
+
 def make_splits(
     label_info: LabelInfo,
     cfg: Dict[str, Any],
     logger: Any,
 ) -> Dict[str, np.ndarray]:
     data = cfg["data"]
+    if str(data.get("split_strategy", "random")).lower() == "temporal":
+        return _make_temporal_splits(label_info, cfg, logger)
     n_rows = label_info.n_rows
     seed = int(cfg["project"]["random_seed"])
     train_fraction = float(data["train_fraction"])
@@ -558,6 +877,21 @@ def make_splits(
         len(splits["test"]),
         seed,
     )
+    cfg.setdefault("_runtime", {})["split_metadata"] = {
+        "strategy": "random",
+        "evaluation_split": "test",
+        "splits": {
+            "train": _split_metadata_for_indices(
+                None, label_info.y, splits["train"]
+            ),
+            "valid": _split_metadata_for_indices(
+                None, label_info.y, splits["valid"]
+            ),
+            "test": _split_metadata_for_indices(
+                None, label_info.y, splits["test"]
+            ),
+        },
+    }
     return splits
 
 

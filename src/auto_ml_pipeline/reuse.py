@@ -46,7 +46,7 @@ _CACHE_DATA_KEYS = (
 
 _ARTIFACT_FILES: Dict[str, Sequence[str]] = {
     "cache": ("cache/manifest.json", "schema/sources.json", "cache/row_coverage.npy"),
-    "splits": ("splits.npz",),
+    "splits": ("splits.npz", "split_metadata.json"),
     "temporal": ("temporal_psi_windows.npz", "temporal_psi_windows.json"),
     "filtering": ("filter_report.csv", "selected_features.json"),
     "preprocessing": ("preprocess_state.json",),
@@ -97,10 +97,17 @@ def _versions(names: Sequence[str]) -> Dict[str, Any]:
 
 def _cache_component(cfg: Dict[str, Any]) -> Dict[str, Any]:
     data = cfg["data"]
+    split_strategy = str(data.get("split_strategy", "random")).lower()
     inputs = [data.get("label_path"), *data.get("feature_paths", [])]
     return {
         "artifact_version": REUSE_STATE_VERSION,
         "data": {key: data.get(key) for key in _CACHE_DATA_KEYS},
+        "split_strategy": split_strategy,
+        "split_time_column": (
+            (data.get("temporal_split") or {}).get("time_column")
+            if split_strategy == "temporal"
+            else None
+        ),
         "type_inference": cfg.get("type_inference", {}),
         "inputs": _input_signatures(inputs),
         "versions": _versions(("pandas", "numpy", "pyarrow")),
@@ -110,8 +117,13 @@ def _cache_component(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def _split_component(cfg: Dict[str, Any], cache_fingerprint: str) -> Dict[str, Any]:
     data = cfg["data"]
+    split_strategy = str(data.get("split_strategy", "random")).lower()
     return {
         "cache": cache_fingerprint,
+        "split_strategy": split_strategy,
+        "temporal_split": (
+            data.get("temporal_split") if split_strategy == "temporal" else None
+        ),
         "max_rows": data.get("max_rows"),
         "train_fraction": data.get("train_fraction"),
         "valid_fraction": data.get("valid_fraction"),
@@ -322,7 +334,15 @@ class ReuseState:
                 )
             )
         if self.reused.get("splits"):
-            actions.append(("splits", self._link_file, self.source / "splits.npz", self.work_dir / "splits.npz"))
+            for name in _ARTIFACT_FILES["splits"]:
+                actions.append(
+                    (
+                        "splits",
+                        self._link_file,
+                        self.source / name,
+                        self.work_dir / name,
+                    )
+                )
         if self.reused.get("temporal"):
             for name in _ARTIFACT_FILES["temporal"]:
                 actions.append(("temporal", self._link_file, self.source / name, self.work_dir / name))
