@@ -372,6 +372,51 @@ Binary tasks optimize validation AUC by default; multiclass tasks optimize
 multiclass log loss. The final model is refit on train+valid, and the selection
 model remains available for an honest out-of-sample validation score.
 
+### KS and cross-validation
+
+Binary classification can tune directly for KS:
+
+```yaml
+tuning:
+  enabled: true
+  metric: ks
+  direction: auto          # maximize
+  n_trials: 30
+  pruning: true
+  cv:
+    enabled: true
+    folds: 5
+    seed: 42
+    prune_after_folds: 2
+```
+
+Each CV trial trains one model per fold, scores the fold with the chosen metric,
+and returns the mean fold score. `best_iteration` for the final refit is the
+median of the fold best iterations. `trials.csv` records `fold_scores` and
+`fold_best_iterations` for each trial. `folds` must not exceed the smallest
+training class count.
+
+With CV enabled, Optuna pruning is evaluated on the running mean after each
+fold. `prune_after_folds` controls when pruning may begin;
+`tuning.n_warmup_steps` is used only when CV is disabled.
+`tuning.timeout_seconds` is checked between trials, so one CV trial can consume
+up to the cost of `folds` model fits.
+
+The folds are built inside the existing training split. Cache, split, filtering,
+preprocessing, and matrix fingerprints are unchanged by `tuning.cv`, so those
+artifacts remain reusable across CV settings. Preprocessing and feature
+selection are fitted on the full training split rather than independently per
+fold; this is practical for model selection but not a strictly nested CV. A
+fully nested design would require per-fold preprocessing and fold-specific
+matrices.
+
+Early stopping inside each model still uses the adapter's native evaluation
+metric (`auc` for binary or `mlogloss` for multiclass). Trial selection uses
+KS when `metric: ks`. This distinction matters if the AUC-optimal and
+KS-optimal iteration counts differ. Without cross-validation, standard
+LightGBM/XGBoost eval logs do not contain KS, so per-iteration Optuna pruning
+is unavailable; fold-level pruning works when `tuning.cv.enabled` is true.
+
 XGBoost is included as a second built-in adapter:
 
 ```yaml
