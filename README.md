@@ -142,14 +142,19 @@ each reusable stage. The pipeline reuses:
 
 Fingerprints cover the relevant data, filtering, and preprocessing config, input
 file paths plus size/mtime, package versions, and the pipeline source files for
-those stages. Changing only `model` or `tuning` leaves every data-stage
-fingerprint unchanged.
+those stages. Filtering has separate fingerprints for metric computation and
+final feature selection.
 
-Reuse is stage-wise. If `filtering.max_features` changes, the cache and splits
-are still reused, while filtering, preprocessing, and the matrix are
-recomputed. If only `preprocessing.add_missing_indicator` changes, cache,
-splits, and filtering are reused. A change to an input CSV invalidates the cache
-and every stage derived from it.
+Changing a selection threshold such as `min_iv`, `max_iv`, `max_psi`,
+`max_features`, or `max_pairwise_corr` reuses the expensive per-column report
+and reapplies the current thresholds without recalculating NaN, uniqueness,
+Pearson, IV, or PSI. Preprocessing and the matrix are restarted when the
+selected columns change. Metric settings including `stats_sample_rows`,
+`iv_bins`, `psi_bins`, `categorical_top_k`, and temporal PSI windows still force
+metric recomputation. A change to an input CSV invalidates the cache and every
+stage derived from it. If a threshold removes every column, the completed
+metrics remain reusable so a relaxed threshold can be tried without repeating
+feature statistics.
 
 `reuse_mode: link` symlinks the cache and matrix directories and copies small
 metadata, split, and filter artifacts. Keep the source run directory as long as
@@ -319,6 +324,9 @@ filtering:
 - `max_pairwise_corr` optionally removes redundant numeric columns greedily,
   keeping the higher-scoring column from each correlated pair.
 - The full per-column report is written to `filter_report.csv`.
+- If filtering removes every column, `filter_report.csv` is still written
+  before the pipeline fails, so the rejection reason for each column remains
+  available for diagnosis.
 
 ## Preprocessing configuration
 

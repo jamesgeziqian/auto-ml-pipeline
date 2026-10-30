@@ -25,6 +25,16 @@ class FilterResult:
     elapsed_seconds: float
 
 
+class FeatureFilteringError(ValueError):
+    """Raised when filtering leaves no usable model features."""
+
+    def __init__(self, result: FilterResult):
+        self.result = result
+        super().__init__(
+            "Feature filtering removed every column. Relax filtering thresholds."
+        )
+
+
 def _numeric_bin_edges(values: np.ndarray, n_bins: int) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
@@ -382,6 +392,32 @@ def compute_stats_and_filter(
         )
 
     report = pd.DataFrame(report_rows)
+    return apply_filter_thresholds(
+        report,
+        fcfg,
+        store,
+        logger,
+        sample_rows,
+        filter_indices=filter_indices,
+        elapsed_seconds=time.perf_counter() - started,
+    )
+
+
+def apply_filter_thresholds(
+    report: pd.DataFrame,
+    fcfg: Dict[str, Any],
+    store: CacheStore,
+    logger: Any,
+    sample_rows: int,
+    filter_indices: Optional[np.ndarray] = None,
+    elapsed_seconds: float = 0.0,
+) -> FilterResult:
+    """Apply filter thresholds to an existing per-column metrics report."""
+    started = time.perf_counter()
+    report = report.copy()
+    stats: Dict[str, Dict[str, Any]] = {
+        str(row["column"]): row for row in report.to_dict("records")
+    }
     keep_columns = {str(column) for column in fcfg.get("keep_columns", [])}
     selected: List[str] = []
     reasons: Dict[str, str] = {}
@@ -456,7 +492,7 @@ def compute_stats_and_filter(
     report["selection_score"] = report["column"].map(lambda column: _selection_score(stats.get(str(column), {})))
     report = report.sort_values(["selected", "selection_score"], ascending=[False, False]).reset_index(drop=True)
 
-    elapsed = time.perf_counter() - started
+    elapsed = elapsed_seconds + (time.perf_counter() - started)
     logger.info(
         "[filter] selected %s/%s columns (%.1f%%) in %.2fs",
         len(selected),
@@ -464,9 +500,15 @@ def compute_stats_and_filter(
         100.0 * len(selected) / max(1, len(report)),
         elapsed,
     )
+    result = FilterResult(
+        selected=selected,
+        report=report,
+        stats=stats,
+        elapsed_seconds=elapsed,
+    )
     if len(selected) == 0:
-        raise ValueError("Feature filtering removed every column. Relax filtering thresholds.")
-    return FilterResult(selected=selected, report=report, stats=stats, elapsed_seconds=elapsed)
+        raise FeatureFilteringError(result)
+    return result
 
 
 def _selection_score(row: Dict[str, Any]) -> float:

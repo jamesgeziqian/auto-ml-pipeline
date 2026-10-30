@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -38,7 +39,19 @@ def _run(
     max_features: int = 20,
     add_missing_indicator: bool = False,
     num_boost_round: int = 20,
+    filtering_overrides: dict[str, Any] | None = None,
 ) -> Path:
+    filtering = {
+        "max_nan_ratio": 0.99,
+        "min_unique": 2,
+        "max_unique_ratio": 0.99,
+        "min_abs_pearson": 0.0,
+        "min_iv": 0.0,
+        "max_psi": 2.0,
+        "max_features": max_features,
+        "max_pairwise_corr": None,
+    }
+    filtering.update(filtering_overrides or {})
     config = {
         "project": {
             "name": name,
@@ -63,16 +76,7 @@ def _run(
             "stratify": True,
             "csv": {"chunksize": 100, "engine": "arrow"},
         },
-        "filtering": {
-            "max_nan_ratio": 0.99,
-            "min_unique": 2,
-            "max_unique_ratio": 0.99,
-            "min_abs_pearson": 0.0,
-            "min_iv": 0.0,
-            "max_psi": 2.0,
-            "max_features": max_features,
-            "max_pairwise_corr": None,
-        },
+        "filtering": filtering,
         "preprocessing": {
             "categorical_encoding": "native",
             "max_categories": 16,
@@ -168,9 +172,38 @@ def test_reuse_full_and_partial_stages(tmp_path: Path) -> None:
     filtered_details = _details(filtered)
     assert "reused_from" in filtered_details["cache_ingest"]
     assert "reused_from" in filtered_details["split"]
-    assert "reused_from" not in filtered_details["filtering_stats"]
+    assert "reused_from" in filtered_details["filtering_stats"]
+    assert filtered_details["filtering_stats"]["metrics_reused"] is True
+    assert filtered_details["filtering_stats"]["thresholds_reapplied"] is True
+    assert filtered_details["filtering_stats"]["n_selected"] == 15
     assert "reused_from" not in filtered_details["preprocess_fit"]
     assert "reused_from" not in filtered_details["matrix_build"]
+
+    baseline_report = pd.read_csv(baseline / "filter_report.csv").set_index("column")
+    filtered_report = pd.read_csv(filtered / "filter_report.csv").set_index("column")
+    pd.testing.assert_series_equal(
+        baseline_report.loc[filtered_report.index, "iv"],
+        filtered_report["iv"],
+        check_names=False,
+    )
+    pd.testing.assert_series_equal(
+        baseline_report.loc[filtered_report.index, "psi"],
+        filtered_report["psi"],
+        check_names=False,
+    )
+
+    metrics_changed = _run(
+        tmp_path,
+        info,
+        "metrics_changed",
+        reuse_from=str(baseline),
+        filtering_overrides={"iv_bins": 4},
+    )
+    metrics_changed_details = _details(metrics_changed)
+    assert "reused_from" in metrics_changed_details["cache_ingest"]
+    assert "reused_from" in metrics_changed_details["split"]
+    assert "reused_from" not in metrics_changed_details["filtering_stats"]
+    assert metrics_changed_details["filtering_stats"]["metrics_reused"] is False
 
     preprocessed = _run(
         tmp_path,
@@ -200,6 +233,29 @@ def test_reuse_invalidated_by_input_change(tmp_path: Path) -> None:
     details = _details(changed)
     assert "reused_from" not in details["cache_ingest"]
     assert "reused_from" not in details["split"]
+
+
+def test_reuse_metrics_from_legacy_report_without_metric_fingerprint(
+    tmp_path: Path,
+) -> None:
+    info = _dataset(tmp_path)
+    baseline = _run(tmp_path, info, "baseline_legacy_metrics")
+    state_path = baseline / "reuse_state.json"
+    state = json.loads(state_path.read_text())
+    state.pop("filter_metrics")
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    filtered = _run(
+        tmp_path,
+        info,
+        "legacy_metrics_reused",
+        reuse_from=str(baseline),
+        max_features=15,
+    )
+    details = _details(filtered)
+    assert details["filtering_stats"]["metrics_reused"] is True
+    assert details["filtering_stats"]["thresholds_reapplied"] is True
+    assert "reused_from" not in details["preprocess_fit"]
 
 
 def test_reuse_resumes_after_preprocessing(tmp_path: Path) -> None:

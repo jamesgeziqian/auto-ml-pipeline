@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import yaml
 
 from .config import ConfigError
 from .preprocess import MatrixResult
@@ -43,6 +44,25 @@ _CACHE_DATA_KEYS = (
     "sample_rows",
     "csv",
 )
+
+_FILTER_METRIC_KEYS = (
+    "stats_sample_rows",
+    "iv_bins",
+    "psi_bins",
+    "categorical_top_k",
+    "temporal_psi",
+)
+
+_FILTER_REPORT_METRIC_COLUMNS = {
+    "column",
+    "dtype",
+    "nan_ratio",
+    "n_unique",
+    "unique_ratio",
+    "abs_pearson",
+    "iv",
+    "psi",
+}
 
 _ARTIFACT_FILES: Dict[str, Sequence[str]] = {
     "cache": ("cache/manifest.json", "schema/sources.json", "cache/row_coverage.npy"),
@@ -168,6 +188,27 @@ def _filter_component(
     }
 
 
+def _filter_metric_component(
+    cfg: Dict[str, Any],
+    cache_fingerprint: str,
+    split_fingerprint: str,
+    temporal_fingerprint: Optional[str],
+) -> Dict[str, Any]:
+    filtering = cfg["filtering"]
+    return {
+        "cache": cache_fingerprint,
+        "splits": split_fingerprint,
+        "temporal": temporal_fingerprint,
+        "metrics": {
+            key: filtering.get(key)
+            for key in _FILTER_METRIC_KEYS
+        },
+        "column_block_size": cfg["data"].get("column_block_size"),
+        "versions": _versions(("pandas", "numpy")),
+        "code": _code_hash(("stats.py",)),
+    }
+
+
 def _preprocess_component(cfg: Dict[str, Any], filter_fingerprint: str) -> Dict[str, Any]:
     return {
         "filtering": filter_fingerprint,
@@ -205,6 +246,16 @@ def stage_fingerprints(cfg: Dict[str, Any]) -> Dict[str, Optional[str]]:
     }
 
 
+def filter_metric_fingerprint(cfg: Dict[str, Any]) -> str:
+    cache = _digest(_cache_component(cfg))
+    splits = _digest(_split_component(cfg, cache))
+    temporal_component = _temporal_component(cfg)
+    temporal = _digest(temporal_component) if temporal_component is not None else None
+    return _digest(
+        _filter_metric_component(cfg, cache, splits, temporal)
+    )
+
+
 class ReuseState:
     """Link reusable artifacts from a previous run and record stage completion."""
 
@@ -213,9 +264,12 @@ class ReuseState:
         self.cfg = cfg
         self.logger = logger
         self.fingerprints = stage_fingerprints(cfg)
+        self.filter_metrics_fingerprint = filter_metric_fingerprint(cfg)
         self.stages: Dict[str, bool] = {stage: False for stage in REUSABLE_STAGES}
+        self.filter_metrics_completed = False
         self.reused: Dict[str, bool] = {}
         self.reasons: Dict[str, str] = {}
+        self.source_filter_metrics: Optional[str] = None
         self.mode = str(cfg["project"].get("reuse_mode", "link")).lower()
         raw_source = cfg["project"].get("reuse_from")
         self.source = Path(raw_source).expanduser().resolve() if raw_source else None
@@ -230,6 +284,7 @@ class ReuseState:
                     "than project.work_dir."
                 )
             self._load_source_state()
+            self.source_filter_metrics = self._load_source_filter_metrics()
             self._evaluate()
             self._materialize()
             for stage, enabled in self.reused.items():
@@ -266,6 +321,32 @@ class ReuseState:
             )
         self.source_state = state
 
+    def _load_source_filter_metrics(self) -> Optional[str]:
+        assert self.source is not None
+        if self.source_state is not None:
+            stored = self.source_state.get("filter_metrics")
+            if stored:
+                return str(stored)
+
+        config_path = self.source / "config_resolved.yaml"
+        report_path = self.source / "filter_report.csv"
+        if not config_path.exists() or not report_path.exists():
+            return None
+        try:
+            source_cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            columns = set(
+                pd.read_csv(report_path, nrows=0).columns.astype(str)
+            )
+        except (OSError, ValueError, yaml.YAMLError):
+            return None
+        if (
+            not isinstance(source_cfg, dict)
+            or "filtering" not in source_cfg
+            or not _FILTER_REPORT_METRIC_COLUMNS.issubset(columns)
+        ):
+            return None
+        return filter_metric_fingerprint(source_cfg)
+
     def _artifacts_present(self, root: Path, stage: str) -> bool:
         if stage == "matrix":
             meta_path = root / "matrix" / "matrix_meta.json"
@@ -279,6 +360,9 @@ class ReuseState:
             return matrix_path.exists()
         return all((root / relative).exists() for relative in _ARTIFACT_FILES.get(stage, ()))
 
+    def _filter_metrics_artifact_present(self, root: Path) -> bool:
+        return (root / "filter_report.csv").exists()
+
     def _evaluate(self) -> None:
         assert self.source_state is not None
         source_stages = self.source_state.get("stages", {})
@@ -287,6 +371,32 @@ class ReuseState:
             fingerprint = self.fingerprints.get(stage)
             if fingerprint is None:
                 self.reasons[stage] = "disabled"
+            elif stage == "filtering":
+                source_metrics_completed = bool(
+                    self.source_state.get("filter_metrics_completed")
+                    or source_stages.get(stage)
+                    or (
+                        self.source_filter_metrics
+                        and self._filter_metrics_artifact_present(self.source)
+                    )
+                )
+                if not source_metrics_completed:
+                    self.reasons[stage] = "not completed in source run"
+                elif (
+                    source_stages.get(stage)
+                    and source_fingerprints.get(stage) == fingerprint
+                    and self._artifacts_present(self.source, stage)
+                ):
+                    self.reused[stage] = True
+                elif (
+                    self.source_filter_metrics == self.filter_metrics_fingerprint
+                    and self._filter_metrics_artifact_present(self.source)
+                ):
+                    self.reused[stage] = True
+                else:
+                    self.reasons[stage] = (
+                        "config, input, version, or code changed"
+                    )
             elif not source_stages.get(stage):
                 self.reasons[stage] = "not completed in source run"
             elif source_fingerprints.get(stage) != fingerprint:
@@ -348,7 +458,11 @@ class ReuseState:
                 actions.append(("temporal", self._link_file, self.source / name, self.work_dir / name))
         if self.reused.get("filtering"):
             for name in _ARTIFACT_FILES["filtering"]:
-                actions.append(("filtering", self._link_file, self.source / name, self.work_dir / name))
+                source_path = self.source / name
+                if source_path.exists():
+                    actions.append(
+                        ("filtering", self._link_file, source_path, self.work_dir / name)
+                    )
         if self.reused.get("preprocessing"):
             name = _ARTIFACT_FILES["preprocessing"][0]
             actions.append(("preprocessing", self._link_file, self.source / name, self.work_dir / name))
@@ -391,6 +505,8 @@ class ReuseState:
             "source": str(self.source) if self.source is not None else None,
             "mode": self.mode,
             "fingerprints": self.fingerprints,
+            "filter_metrics": self.filter_metrics_fingerprint,
+            "filter_metrics_completed": self.filter_metrics_completed,
             "stages": self.stages,
             "reasons": dict(self.reasons),
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -409,6 +525,12 @@ class ReuseState:
         if stage not in self.stages:
             return
         self.stages[stage] = True
+        if stage == "filtering":
+            self.filter_metrics_completed = True
+        self._write_state()
+
+    def mark_filter_metrics(self) -> None:
+        self.filter_metrics_completed = True
         self._write_state()
 
     def as_dict(self) -> Dict[str, Any]:
@@ -419,6 +541,8 @@ class ReuseState:
             "stages": dict(self.stages),
             "reasons": dict(self.reasons),
             "fingerprints": dict(self.fingerprints),
+            "filter_metrics": self.filter_metrics_fingerprint,
+            "filter_metrics_completed": self.filter_metrics_completed,
         }
 
     def load_schema_stats(self) -> Dict[str, Any]:
@@ -438,8 +562,11 @@ class ReuseState:
 
     def load_filter_result(self) -> FilterResult:
         report = pd.read_csv(self.work_dir / "filter_report.csv")
-        selected_payload = json.loads(
-            (self.work_dir / "selected_features.json").read_text(encoding="utf-8")
+        selected_path = self.work_dir / "selected_features.json"
+        selected_payload = (
+            json.loads(selected_path.read_text(encoding="utf-8"))
+            if selected_path.exists()
+            else {}
         )
         return FilterResult(
             selected=[str(column) for column in selected_payload.get("selected", [])],

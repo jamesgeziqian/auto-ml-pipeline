@@ -41,7 +41,11 @@ from .schema import (
     make_splits,
     save_json,
 )
-from .stats import compute_stats_and_filter
+from .stats import (
+    FeatureFilteringError,
+    apply_filter_thresholds,
+    compute_stats_and_filter,
+)
 from .temporal import load_temporal_psi_windows
 from .tuning import tune_and_train
 
@@ -325,49 +329,79 @@ class AutoMLPipeline:
                 )
                 store = CacheStore(self.work_dir, manifest)
                 with self.recorder.stage("filtering_stats", "nan/nunique/pearson/IV/PSI") as stage:
-                    if self.reuse.can_reuse("filtering"):
-                        filter_result = self.reuse.load_filter_result()
+                    metrics_reused = self.reuse.can_reuse("filtering")
+                    try:
+                        if metrics_reused:
+                            cached_result = self.reuse.load_filter_result()
+                            filter_result = apply_filter_thresholds(
+                                cached_result.report,
+                                self.cfg["filtering"],
+                                store,
+                                self.logger,
+                                int(self.cfg["data"].get("sample_rows", 2000)),
+                                filter_indices=splits.get("filter_indices"),
+                            )
+                        else:
+                            filter_result = compute_stats_and_filter(
+                                store,
+                                label_info.y,
+                                splits,
+                                self.cfg,
+                                self.logger,
+                                self.heartbeat,
+                                temporal_windows=temporal_windows,
+                            )
+                    except FeatureFilteringError as exc:
+                        report_path = self.work_dir / "filter_report.csv"
+                        exc.result.report.to_csv(report_path, index=False)
+                        self.reuse.mark_filter_metrics()
                         stage.update(
                             {
-                                "n_columns": len(filter_result.report),
-                                "n_selected": len(filter_result.selected),
-                                "psi_mode": psi_mode,
+                                "n_columns": len(exc.result.report),
+                                "n_selected": 0,
+                                "report_path": str(report_path),
+                            }
+                        )
+                        self.logger.error(
+                            "[filter] removed every column; report saved to %s",
+                            report_path,
+                        )
+                        raise ValueError(
+                            f"{exc} Filter report saved to {report_path}."
+                        ) from exc
+                    filter_result.report.to_csv(
+                        self.work_dir / "filter_report.csv", index=False
+                    )
+                    save_json(
+                        self.work_dir / "selected_features.json",
+                        {
+                            "selected": filter_result.selected,
+                            "n_selected": len(filter_result.selected),
+                            "n_total": len(filter_result.report),
+                            "elapsed_seconds": filter_result.elapsed_seconds,
+                            "psi_mode": psi_mode,
+                        },
+                    )
+                    self.reuse.mark("filtering")
+                    stage.update(
+                        {
+                            "n_columns": len(filter_result.report),
+                            "n_selected": len(filter_result.selected),
+                            "psi_mode": psi_mode,
+                            "metrics_reused": metrics_reused,
+                        }
+                    )
+                    if metrics_reused:
+                        stage.update(
+                            {
                                 "reused_from": str(self.reuse.source),
+                                "thresholds_reapplied": True,
                             }
                         )
                         self.logger.info(
-                            "[reuse] filtering_stats from %s", self.reuse.source
-                        )
-                    else:
-                        filter_result = compute_stats_and_filter(
-                            store,
-                            label_info.y,
-                            splits,
-                            self.cfg,
-                            self.logger,
-                            self.heartbeat,
-                            temporal_windows=temporal_windows,
-                        )
-                        filter_result.report.to_csv(
-                            self.work_dir / "filter_report.csv", index=False
-                        )
-                        save_json(
-                            self.work_dir / "selected_features.json",
-                            {
-                                "selected": filter_result.selected,
-                                "n_selected": len(filter_result.selected),
-                                "n_total": len(filter_result.report),
-                                "elapsed_seconds": filter_result.elapsed_seconds,
-                                "psi_mode": psi_mode,
-                            },
-                        )
-                        self.reuse.mark("filtering")
-                        stage.update(
-                            {
-                                "n_columns": len(filter_result.report),
-                                "n_selected": len(filter_result.selected),
-                                "psi_mode": psi_mode,
-                            }
+                            "[reuse] filtering metrics from %s; "
+                            "reapplied current thresholds",
+                            self.reuse.source,
                         )
 
                 with self.recorder.stage("preprocess_fit", "imputers and encoders") as stage:
