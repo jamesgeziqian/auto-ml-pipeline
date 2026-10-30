@@ -47,6 +47,7 @@ DEFAULTS: Dict[str, Any] = {
             "max_positive_count": None,
         },
         "include_label_features": True,
+        "drop_unmatched_rows": False,
         "drop_columns": [],
         "deduplicate_columns": True,
         "column_block_size": 32,
@@ -340,6 +341,8 @@ def validate_config(cfg: Dict[str, Any]) -> None:
 
     if data["concat_mode"] not in {"column", "row"}:
         raise ConfigError("data.concat_mode must be 'column' or 'row'.")
+    if not isinstance(data.get("drop_unmatched_rows"), bool):
+        raise ConfigError("data.drop_unmatched_rows must be true or false.")
     split_strategy = str(data.get("split_strategy", "random")).lower()
     if split_strategy not in {"random", "temporal"}:
         raise ConfigError("data.split_strategy must be 'random' or 'temporal'.")

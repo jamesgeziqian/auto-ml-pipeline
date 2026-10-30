@@ -13,6 +13,7 @@ data:
   label_key: customer_id
   label_column: target
   concat_mode: column
+  drop_unmatched_rows: false
   column_block_size: 16
   sample_rows: 500
   train_fraction: 0.7

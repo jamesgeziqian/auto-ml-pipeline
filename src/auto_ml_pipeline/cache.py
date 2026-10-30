@@ -382,7 +382,8 @@ def _ingest_blocked_wide_arrow(
             row_indices = positions.astype(np.int64)
             duplicate_rows += int(source_seen[row_indices].sum())
             source_seen[row_indices] = True
-            coverage[row_indices] = True
+            if source.kind == "features":
+                coverage[row_indices] = True
             rows_written += batch.num_rows
             # Arrow batches are byte-sized, so slice them to honour chunk_rows
             # and keep buffered memory and row-group sizes predictable.
@@ -499,7 +500,8 @@ def _ingest_blocked_wide(
             row_indices = chunk[ROW_INDEX].to_numpy(dtype=np.int64)
             duplicate_rows += int(source_seen[row_indices].sum())
             source_seen[row_indices] = True
-            coverage[row_indices] = True
+            if source.kind == "features":
+                coverage[row_indices] = True
             rows_written += len(chunk)
 
             for group_index, group in enumerate(groups):
@@ -764,7 +766,8 @@ def build_cache(
                 row_indices = chunk[ROW_INDEX].to_numpy(dtype=np.int64)
                 duplicate_rows += int(group_seen[row_indices].sum())
                 group_seen[row_indices] = True
-                coverage[row_indices] = True
+                if source.kind == "features":
+                    coverage[row_indices] = True
                 rows_written += len(chunk)
 
                 part_path = source_dir / f"part_{chunk_number:06d}.parquet"
@@ -841,12 +844,14 @@ def build_cache(
     min_coverage = float(cfg["filtering"].get("min_row_coverage", 0.0))
     if coverage_ratio < min_coverage:
         raise ValueError(
-            f"Only {coverage_ratio:.1%} of label rows have feature data, below "
+            f"Only {coverage_ratio:.1%} of label rows match an external feature "
+            f"file, below "
             f"filtering.min_row_coverage={min_coverage:.1%}."
         )
     if coverage_ratio < 1.0:
         logger.warning(
-            "[ingest] %.2f%% of label rows have no cached feature row; they will contain NaNs",
+            "[ingest] %.2f%% of label rows have no external feature-file match; "
+            "they will contain NaNs unless data.drop_unmatched_rows is enabled",
             (1.0 - coverage_ratio) * 100.0,
         )
 

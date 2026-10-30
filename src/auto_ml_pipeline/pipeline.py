@@ -241,6 +241,12 @@ class AutoMLPipeline:
                                     name: len(indices)
                                     for name, indices in splits.items()
                                 },
+                                "eligible_rows": split_metadata.get(
+                                    "eligible_rows"
+                                ),
+                                "dropped_unmatched_rows": split_metadata.get(
+                                    "dropped_unmatched_rows"
+                                ),
                                 "reused_from": str(self.reuse.source),
                                 "strategy": split_metadata.get(
                                     "strategy", "random"
@@ -252,7 +258,24 @@ class AutoMLPipeline:
                         )
                         self.logger.info("[reuse] split from %s", self.reuse.source)
                     else:
-                        splits = make_splits(label_info, self.cfg, self.logger)
+                        eligible_indices = None
+                        if self.cfg["data"].get("drop_unmatched_rows", False):
+                            coverage = np.load(
+                                self.work_dir / "cache" / "row_coverage.npy"
+                            )
+                            eligible_indices = np.flatnonzero(coverage)
+                            self.logger.info(
+                                "[split] drop_unmatched_rows=true: "
+                                "keeping %s/%s label rows with feature matches",
+                                len(eligible_indices),
+                                label_info.n_rows,
+                            )
+                        splits = make_splits(
+                            label_info,
+                            self.cfg,
+                            self.logger,
+                            eligible_indices=eligible_indices,
+                        )
                         np.savez(self.work_dir / "splits.npz", **splits)
                         split_metadata = self.cfg.get("_runtime", {}).get(
                             "split_metadata", {}
@@ -268,6 +291,12 @@ class AutoMLPipeline:
                                     name: len(indices)
                                     for name, indices in splits.items()
                                 },
+                                "eligible_rows": split_metadata.get(
+                                    "eligible_rows"
+                                ),
+                                "dropped_unmatched_rows": split_metadata.get(
+                                    "dropped_unmatched_rows"
+                                ),
                                 "strategy": split_metadata.get(
                                     "strategy", "random"
                                 ),

@@ -818,14 +818,99 @@ def _make_temporal_splits(
     }
 
 
+def _subset_label_info(
+    label_info: LabelInfo,
+    indices: np.ndarray,
+) -> LabelInfo:
+    return LabelInfo(
+        keys=label_info.keys[indices],
+        raw_labels=label_info.raw_labels[indices],
+        y=label_info.y[indices],
+        classes=label_info.classes,
+        task=label_info.task,
+        label_column=label_info.label_column,
+        label_key=label_info.label_key,
+        class_mapping=label_info.class_mapping,
+    )
+
+
 def make_splits(
+    label_info: LabelInfo,
+    cfg: Dict[str, Any],
+    logger: Any,
+    eligible_indices: Optional[np.ndarray] = None,
+) -> Dict[str, np.ndarray]:
+    data = cfg["data"]
+    restricted = eligible_indices is not None
+    if eligible_indices is None:
+        eligible = np.arange(label_info.n_rows, dtype=np.int64)
+    else:
+        eligible = np.asarray(eligible_indices, dtype=np.int64)
+        if eligible.ndim != 1:
+            raise ConfigError("Eligible row indices must be one-dimensional.")
+        if (
+            len(eligible)
+            and (
+                eligible.min() < 0
+                or eligible.max() >= label_info.n_rows
+            )
+        ):
+            raise ConfigError("Eligible row indices contain out-of-range values.")
+        if len(np.unique(eligible)) != len(eligible):
+            raise ConfigError("Eligible row indices must be unique.")
+        eligible = np.sort(eligible)
+    if len(eligible) == 0:
+        raise ConfigError(
+            "data.drop_unmatched_rows removed every label row because no "
+            "feature-file keys matched."
+        )
+    split_info = (
+        label_info if len(eligible) == label_info.n_rows else _subset_label_info(label_info, eligible)
+    )
+    if str(data.get("split_strategy", "random")).lower() == "temporal":
+        splits = _make_temporal_splits(split_info, cfg, logger)
+    else:
+        splits = _make_random_splits(split_info, cfg, logger)
+
+    if restricted:
+        splits = {
+            name: eligible[indices]
+            for name, indices in splits.items()
+        }
+        if "filter_indices" not in splits:
+            splits["filter_indices"] = eligible
+
+    metadata = cfg.setdefault("_runtime", {}).setdefault(
+        "split_metadata", {}
+    )
+    metadata["eligible_rows"] = int(len(eligible))
+    metadata["dropped_unmatched_rows"] = int(
+        label_info.n_rows - len(eligible)
+    )
+    metadata["drop_unmatched_rows"] = bool(restricted)
+    split_names = ("train", "valid", "oot") if "oot" in splits else ("train", "valid", "test")
+    timestamps = (
+        _load_label_timestamps(label_info, cfg)
+        if metadata.get("strategy") == "temporal"
+        else None
+    )
+    metadata["splits"] = {
+        name: _split_metadata_for_indices(
+            timestamps,
+            label_info.y,
+            np.asarray(splits[name], dtype=np.int64),
+        )
+        for name in split_names
+    }
+    return splits
+
+
+def _make_random_splits(
     label_info: LabelInfo,
     cfg: Dict[str, Any],
     logger: Any,
 ) -> Dict[str, np.ndarray]:
     data = cfg["data"]
-    if str(data.get("split_strategy", "random")).lower() == "temporal":
-        return _make_temporal_splits(label_info, cfg, logger)
     n_rows = label_info.n_rows
     seed = int(cfg["project"]["random_seed"])
     train_fraction = float(data["train_fraction"])
@@ -880,17 +965,6 @@ def make_splits(
     cfg.setdefault("_runtime", {})["split_metadata"] = {
         "strategy": "random",
         "evaluation_split": "test",
-        "splits": {
-            "train": _split_metadata_for_indices(
-                None, label_info.y, splits["train"]
-            ),
-            "valid": _split_metadata_for_indices(
-                None, label_info.y, splits["valid"]
-            ),
-            "test": _split_metadata_for_indices(
-                None, label_info.y, splits["test"]
-            ),
-        },
     }
     return splits
 

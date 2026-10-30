@@ -149,6 +149,7 @@ def _split_component(cfg: Dict[str, Any], cache_fingerprint: str) -> Dict[str, A
         "valid_fraction": data.get("valid_fraction"),
         "test_fraction": data.get("test_fraction"),
         "stratify": data.get("stratify"),
+        "drop_unmatched_rows": data.get("drop_unmatched_rows", False),
         "seed": cfg["project"].get("random_seed"),
         "inputs": _input_signatures([data.get("label_path")]),
         "versions": _versions(("sklearn", "numpy")),

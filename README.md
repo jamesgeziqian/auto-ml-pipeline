@@ -179,6 +179,7 @@ data:
   concat_mode: column        # column = horizontal join by key
                              # row    = append files with identical schemas
   include_label_features: true
+  drop_unmatched_rows: false # true = exclude labels absent from every feature file
   column_block_size: 32
   sample_rows: 2000
   max_rows: null
@@ -201,6 +202,13 @@ data:
 config directory first, then the current working directory. The label file may
 contain extra feature columns; they are included in the model unless
 `include_label_features` is false.
+
+By default, label rows with no matching row in any feature file are retained
+with NaN feature values. Set `data.drop_unmatched_rows: true` to exclude those
+rows from filtering and every train/valid/test split. Extra columns in the label
+file do not count as a feature-file match. The full cache remains keyed by the
+label row order for reuse, but unmatched rows never enter training or
+evaluation.
 
 `csv.engine: arrow` streams each file through `pyarrow.csv` and writes the
 column-blocked Parquet cache directly, without building a wide pandas frame.
