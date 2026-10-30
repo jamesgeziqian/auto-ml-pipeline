@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import copy
 import csv as csv_module
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -90,6 +91,7 @@ DEFAULTS: Dict[str, Any] = {
         "max_unique_ratio": 0.98,
         "min_abs_pearson": 0.0,
         "min_iv": 0.0,
+        "max_iv": None,
         "max_psi": 0.5,
         "max_features": 2000,
         "max_pairwise_corr": None,
@@ -460,6 +462,30 @@ def validate_config(cfg: Dict[str, Any]) -> None:
                 raise ConfigError("tuning.cv.seed must be an integer or null.") from exc
     if float(project["heartbeat_seconds"]) <= 0:
         raise ConfigError("project.heartbeat_seconds must be positive.")
+    filtering = cfg["filtering"]
+    iv_limits: Dict[str, Optional[float]] = {}
+    for key in ("min_iv", "max_iv"):
+        value = filtering.get(key)
+        if value is None:
+            iv_limits[key] = None
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"filtering.{key} must be a finite non-negative number or null."
+            ) from exc
+        if not math.isfinite(parsed) or parsed < 0:
+            raise ConfigError(
+                f"filtering.{key} must be a finite non-negative number or null."
+            )
+        iv_limits[key] = parsed
+    if (
+        iv_limits["min_iv"] is not None
+        and iv_limits["max_iv"] is not None
+        and iv_limits["min_iv"] > iv_limits["max_iv"]
+    ):
+        raise ConfigError("filtering.min_iv must not exceed filtering.max_iv.")
     reuse_mode = str(project.get("reuse_mode", "link")).lower()
     if reuse_mode not in {"link", "copy"}:
         raise ConfigError("project.reuse_mode must be 'link' or 'copy'.")

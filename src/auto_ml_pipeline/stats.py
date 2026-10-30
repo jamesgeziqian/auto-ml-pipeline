@@ -408,6 +408,9 @@ def compute_stats_and_filter(
         min_iv = float(fcfg.get("min_iv", 0.0))
         if min_iv > 0 and np.isfinite(row["iv"]) and row["iv"] < min_iv:
             fail_reasons.append("iv")
+        max_iv = fcfg.get("max_iv")
+        if max_iv is not None and np.isfinite(row["iv"]) and row["iv"] > float(max_iv):
+            fail_reasons.append("max_iv")
         max_psi = float(fcfg.get("max_psi", 0.5))
         if np.isfinite(row["psi"]) and row["psi"] > max_psi:
             fail_reasons.append("psi")

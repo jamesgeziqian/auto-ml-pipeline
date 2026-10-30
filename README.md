@@ -273,6 +273,7 @@ filtering:
   max_unique_ratio: 0.98
   min_abs_pearson: 0.01
   min_iv: 0.001
+  max_iv: null                    # Reject IV > max_iv; null disables the limit
   max_psi: 0.5
   max_features: 500
   max_pairwise_corr: 0.98
@@ -297,6 +298,10 @@ filtering:
 
 - IV uses the training split and quantile bins for numeric columns or the top-K
   categories for categorical columns.
+- `max_iv` excludes features whose IV is strictly greater than the threshold.
+  This keeps unusually strong signals out of the model so they can be handled
+  as candidate rules downstream. Rejected features remain in
+  `filter_report.csv` with reason `max_iv`; `null` disables the limit.
 - With temporal PSI disabled, PSI compares the random training and test splits.
 - With temporal PSI enabled, PSI compares two configured time windows. Numeric
   bin edges and categorical vocabularies are derived from the reference period
