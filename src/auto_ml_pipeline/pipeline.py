@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import shutil
-import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +28,7 @@ from .metrics import (
     binary_metrics,
     build_predictions,
     multiclass_metrics,
+    prediction_distribution_psi,
     save_metric_plots,
     save_metrics_json,
     select_binary_threshold,
@@ -65,9 +65,7 @@ class AutoMLPipeline:
         self.report_dir.mkdir(parents=True, exist_ok=True)
         self.cfg["output"]["report_dir"] = str(self.report_dir)
         self.cfg["project"]["work_dir"] = str(self.work_dir)
-        self.heartbeat = Heartbeat(
-            self.logger, float(cfg["project"].get("heartbeat_seconds", 15))
-        )
+        self.heartbeat = Heartbeat(self.logger, float(cfg["project"].get("heartbeat_seconds", 15)))
         self.recorder = StageRecorder(self.logger, self.heartbeat)
         self.status = "running"
         self.error: Optional[str] = None
@@ -82,9 +80,7 @@ class AutoMLPipeline:
             archived = requested.with_name(f"{requested.name}.old.{stamp}")
             shutil.move(str(requested), str(archived))
             requested.mkdir(parents=True, exist_ok=True)
-            self.logger.warning(
-                "[setup] existing work_dir archived to %s (recoverable)", archived
-            )
+            self.logger.warning("[setup] existing work_dir archived to %s (recoverable)", archived)
             return requested
         new_dir = requested.with_name(f"{requested.name}_{stamp}")
         new_dir.mkdir(parents=True, exist_ok=True)
@@ -145,9 +141,7 @@ class AutoMLPipeline:
                             ROW_INDEX: np.arange(label_info.n_rows, dtype=np.int64),
                             self.cfg["data"]["label_key"]: label_info.keys,
                         }
-                    ).to_parquet(
-                        self.work_dir / "keys.parquet", index=False, compression="zstd"
-                    )
+                    ).to_parquet(self.work_dir / "keys.parquet", index=False, compression="zstd")
                     save_json(
                         self.work_dir / "class_map.json",
                         {
@@ -168,13 +162,9 @@ class AutoMLPipeline:
                                 "reused_from": str(self.reuse.source),
                             }
                         )
-                        self.logger.info(
-                            "[reuse] schema_inference from %s", self.reuse.source
-                        )
+                        self.logger.info("[reuse] schema_inference from %s", self.reuse.source)
                     else:
-                        sources, schema_stats = discover_sources(
-                            self.cfg, label_info, self.logger
-                        )
+                        sources, schema_stats = discover_sources(self.cfg, label_info, self.logger)
                         stage.update(schema_stats)
                         save_json(
                             self.work_dir / "schema" / "sources.json",
@@ -197,15 +187,10 @@ class AutoMLPipeline:
                                 "reused_from": str(self.reuse.source),
                             }
                         )
-                        self.logger.info(
-                            "[reuse] cache_ingest from %s", self.reuse.source
-                        )
+                        self.logger.info("[reuse] cache_ingest from %s", self.reuse.source)
                     else:
                         if sources is None:
-                            raise RuntimeError(
-                                "Cache reuse was not available but source discovery "
-                                "was skipped."
-                            )
+                            raise RuntimeError("Cache reuse was not available but source discovery " "was skipped.")
                         manifest = build_cache(
                             self.cfg,
                             sources,
@@ -237,36 +222,22 @@ class AutoMLPipeline:
                         self.cfg.setdefault("_runtime", {})["split_metadata"] = split_metadata
                         stage.update(
                             {
-                                **{
-                                    name: len(indices)
-                                    for name, indices in splits.items()
-                                },
-                                "eligible_rows": split_metadata.get(
-                                    "eligible_rows"
-                                ),
-                                "dropped_unmatched_rows": split_metadata.get(
-                                    "dropped_unmatched_rows"
-                                ),
+                                **{name: len(indices) for name, indices in splits.items()},
+                                "eligible_rows": split_metadata.get("eligible_rows"),
+                                "dropped_unmatched_rows": split_metadata.get("dropped_unmatched_rows"),
                                 "reused_from": str(self.reuse.source),
-                                "strategy": split_metadata.get(
-                                    "strategy", "random"
-                                ),
-                                "evaluation_split": split_metadata.get(
-                                    "evaluation_split", "test"
-                                ),
+                                "strategy": split_metadata.get("strategy", "random"),
+                                "evaluation_split": split_metadata.get("evaluation_split", "test"),
                             }
                         )
                         self.logger.info("[reuse] split from %s", self.reuse.source)
                     else:
                         eligible_indices = None
                         if self.cfg["data"].get("drop_unmatched_rows", False):
-                            coverage = np.load(
-                                self.work_dir / "cache" / "row_coverage.npy"
-                            )
+                            coverage = np.load(self.work_dir / "cache" / "row_coverage.npy")
                             eligible_indices = np.flatnonzero(coverage)
                             self.logger.info(
-                                "[split] drop_unmatched_rows=true: "
-                                "keeping %s/%s label rows with feature matches",
+                                "[split] drop_unmatched_rows=true: " "keeping %s/%s label rows with feature matches",
                                 len(eligible_indices),
                                 label_info.n_rows,
                             )
@@ -277,9 +248,7 @@ class AutoMLPipeline:
                             eligible_indices=eligible_indices,
                         )
                         np.savez(self.work_dir / "splits.npz", **splits)
-                        split_metadata = self.cfg.get("_runtime", {}).get(
-                            "split_metadata", {}
-                        )
+                        split_metadata = self.cfg.get("_runtime", {}).get("split_metadata", {})
                         save_json(
                             self.work_dir / "split_metadata.json",
                             split_metadata,
@@ -287,22 +256,11 @@ class AutoMLPipeline:
                         self.reuse.mark("splits")
                         stage.update(
                             {
-                                **{
-                                    name: len(indices)
-                                    for name, indices in splits.items()
-                                },
-                                "eligible_rows": split_metadata.get(
-                                    "eligible_rows"
-                                ),
-                                "dropped_unmatched_rows": split_metadata.get(
-                                    "dropped_unmatched_rows"
-                                ),
-                                "strategy": split_metadata.get(
-                                    "strategy", "random"
-                                ),
-                                "evaluation_split": split_metadata.get(
-                                    "evaluation_split", "test"
-                                ),
+                                **{name: len(indices) for name, indices in splits.items()},
+                                "eligible_rows": split_metadata.get("eligible_rows"),
+                                "dropped_unmatched_rows": split_metadata.get("dropped_unmatched_rows"),
+                                "strategy": split_metadata.get("strategy", "random"),
+                                "evaluation_split": split_metadata.get("evaluation_split", "test"),
                             }
                         )
 
@@ -319,13 +277,9 @@ class AutoMLPipeline:
                                 "reused_from": str(self.reuse.source),
                             }
                         )
-                        self.logger.info(
-                            "[reuse] temporal_psi_windows from %s", self.reuse.source
-                        )
+                        self.logger.info("[reuse] temporal_psi_windows from %s", self.reuse.source)
                     else:
-                        temporal_windows = load_temporal_psi_windows(
-                            self.cfg, label_info, self.logger
-                        )
+                        temporal_windows = load_temporal_psi_windows(self.cfg, label_info, self.logger)
                     if temporal_windows is None:
                         stage.update({"enabled": False, "psi_mode": "train_test"})
                     elif not self.reuse.can_reuse("temporal"):
@@ -350,11 +304,7 @@ class AutoMLPipeline:
                 psi_mode = (
                     "temporal"
                     if temporal_windows is not None
-                    else (
-                        "train_valid"
-                        if "filter_test" in splits
-                        else "train_test"
-                    )
+                    else ("train_valid" if "filter_test" in splits else "train_test")
                 )
                 store = CacheStore(self.work_dir, manifest)
                 with self.recorder.stage("filtering_stats", "nan/nunique/pearson/IV/PSI") as stage:
@@ -395,12 +345,8 @@ class AutoMLPipeline:
                             "[filter] removed every column; report saved to %s",
                             report_path,
                         )
-                        raise ValueError(
-                            f"{exc} Filter report saved to {report_path}."
-                        ) from exc
-                    filter_result.report.to_csv(
-                        self.work_dir / "filter_report.csv", index=False
-                    )
+                        raise ValueError(f"{exc} Filter report saved to {report_path}.") from exc
+                    filter_result.report.to_csv(self.work_dir / "filter_report.csv", index=False)
                     save_json(
                         self.work_dir / "selected_features.json",
                         {
@@ -428,8 +374,7 @@ class AutoMLPipeline:
                             }
                         )
                         self.logger.info(
-                            "[reuse] filtering metrics from %s; "
-                            "reapplied current thresholds",
+                            "[reuse] filtering metrics from %s; " "reapplied current thresholds",
                             self.reuse.source,
                         )
 
@@ -444,9 +389,7 @@ class AutoMLPipeline:
                                 "reused_from": str(self.reuse.source),
                             }
                         )
-                        self.logger.info(
-                            "[reuse] preprocess_fit from %s", self.reuse.source
-                        )
+                        self.logger.info("[reuse] preprocess_fit from %s", self.reuse.source)
                     else:
                         preprocess_state = fit_preprocessing(
                             store,
@@ -457,9 +400,7 @@ class AutoMLPipeline:
                             self.logger,
                             self.heartbeat,
                         )
-                        save_json(
-                            self.work_dir / "preprocess_state.json", preprocess_state
-                        )
+                        save_json(self.work_dir / "preprocess_state.json", preprocess_state)
                         self.reuse.mark("preprocessing")
                         stage.update(
                             {
@@ -472,9 +413,7 @@ class AutoMLPipeline:
                 with self.recorder.stage("matrix_build", "materialize bounded model matrix") as stage:
                     if self.reuse.can_reuse("matrix"):
                         matrix = self.reuse.load_matrix(label_info.y)
-                        self.logger.info(
-                            "[reuse] matrix_build from %s", self.reuse.source
-                        )
+                        self.logger.info("[reuse] matrix_build from %s", self.reuse.source)
                     else:
                         matrix = build_matrix(
                             store,
@@ -491,11 +430,7 @@ class AutoMLPipeline:
                             "n_rows": int(matrix.X.shape[0]),
                             "n_features": int(matrix.X.shape[1]),
                             "sparse": matrix.sparse,
-                            **(
-                                {"reused_from": str(self.reuse.source)}
-                                if self.reuse.can_reuse("matrix")
-                                else {}
-                            ),
+                            **({"reused_from": str(self.reuse.source)} if self.reuse.can_reuse("matrix") else {}),
                         }
                     )
 
@@ -527,12 +462,8 @@ class AutoMLPipeline:
                             "direction": tuning_result.direction,
                             "best_iteration": tuning_result.best_iteration,
                             "n_trials_run": int(len(tuning_result.trials)),
-                            "n_trials_complete": _trial_count(
-                                tuning_result.trials, "COMPLETE"
-                            ),
-                            "n_trials_pruned": _trial_count(
-                                tuning_result.trials, "PRUNED"
-                            ),
+                            "n_trials_complete": _trial_count(tuning_result.trials, "COMPLETE"),
+                            "n_trials_pruned": _trial_count(tuning_result.trials, "PRUNED"),
                         }
                     )
 
@@ -554,13 +485,12 @@ class AutoMLPipeline:
                         {
                             "primary_valid": metrics.get("primary_valid"),
                             "primary_test": metrics.get("primary_test"),
+                            "prediction_psi": (metrics.get("test", {}).get("prediction_psi", {}).get("value")),
                         }
                     )
 
                 with self.recorder.stage("reporting", "artifacts and summary") as stage:
-                    self._write_reports(
-                        tuning_result, metrics, predictions, matrix, filter_result, manifest
-                    )
+                    self._write_reports(tuning_result, metrics, predictions, matrix, filter_result, manifest)
                     stage.update({"report_dir": str(self.report_dir)})
 
                 self.status = "success"
@@ -576,18 +506,10 @@ class AutoMLPipeline:
                             "n_output_features": int(matrix.X.shape[1]),
                             "cache_bytes": manifest["total_cache_bytes"],
                             "psi_mode": psi_mode,
-                            "split_strategy": split_metadata.get(
-                                "strategy", "random"
-                            ),
-                            "evaluation_split": split_metadata.get(
-                                "evaluation_split", "test"
-                            ),
+                            "split_strategy": split_metadata.get("strategy", "random"),
+                            "evaluation_split": split_metadata.get("evaluation_split", "test"),
                             "split_metadata": split_metadata,
-                            "temporal_psi": (
-                                temporal_windows.metadata
-                                if temporal_windows is not None
-                                else None
-                            ),
+                            "temporal_psi": (temporal_windows.metadata if temporal_windows is not None else None),
                         },
                         "tuning": {
                             "metric": tuning_result.metric,
@@ -595,12 +517,8 @@ class AutoMLPipeline:
                             "best_params": tuning_result.params,
                             "best_iteration": tuning_result.best_iteration,
                             "n_trials_run": int(len(tuning_result.trials)),
-                            "n_trials_complete": _trial_count(
-                                tuning_result.trials, "COMPLETE"
-                            ),
-                            "n_trials_pruned": _trial_count(
-                                tuning_result.trials, "PRUNED"
-                            ),
+                            "n_trials_complete": _trial_count(tuning_result.trials, "COMPLETE"),
+                            "n_trials_pruned": _trial_count(tuning_result.trials, "PRUNED"),
                         },
                         "metrics": metrics,
                         "stage_timings": self.recorder.as_dict(),
@@ -608,9 +526,7 @@ class AutoMLPipeline:
                             "report_dir": str(self.report_dir),
                             "model": str(self.work_dir / "model" / "model.txt"),
                             "filter_report": str(self.work_dir / "filter_report.csv"),
-                            "split_metadata": str(
-                                self.work_dir / "split_metadata.json"
-                            ),
+                            "split_metadata": str(self.work_dir / "split_metadata.json"),
                             "temporal_psi_windows": (
                                 str(self.work_dir / "temporal_psi_windows.json")
                                 if temporal_windows is not None
@@ -621,9 +537,7 @@ class AutoMLPipeline:
                                 if temporal_windows is not None
                                 else None
                             ),
-                            "predictions_test": str(
-                                self.report_dir / "predictions_test.csv"
-                            ),
+                            "predictions_test": str(self.report_dir / "predictions_test.csv"),
                             "predictions_oot": (
                                 str(self.report_dir / "predictions_oot.csv")
                                 if split_metadata.get("strategy") == "temporal"
@@ -708,6 +622,24 @@ class AutoMLPipeline:
             primary_valid = valid_metrics.get("f1_macro")
             primary_test = test_metrics.get("f1_macro")
 
+        reference_prob = tuning_result.oof_validation_probabilities
+        reference_name = "validation_oof"
+        if reference_prob is None:
+            reference_prob = valid_prob
+            reference_name = "validation"
+        comparison_split = (
+            "oot" if self.cfg.get("_runtime", {}).get("split_metadata", {}).get("strategy") == "temporal" else "test"
+        )
+        test_metrics["prediction_psi"] = prediction_distribution_psi(
+            reference_prob,
+            test_prob,
+            task,
+            int(self.cfg["metrics"].get("prediction_psi_bins", 10)),
+            reference_name=reference_name,
+            comparison_name=comparison_split,
+            class_names=label_info.classes,
+        )
+
         valid_predictions = build_predictions(
             keys[splits["valid"]],
             y_valid,
@@ -769,6 +701,15 @@ class AutoMLPipeline:
                 _metric(metrics, "f1_weighted"),
                 _metric(metrics, "auc_ovr_macro"),
             )
+        prediction_psi = metrics.get("prediction_psi")
+        if isinstance(prediction_psi, dict):
+            self.logger.info(
+                "[metrics] %-5s prediction_psi=%.4f reference=%s comparison=%s",
+                split,
+                _metric(prediction_psi, "value"),
+                prediction_psi.get("reference"),
+                prediction_psi.get("comparison"),
+            )
 
     def _write_reports(
         self,
@@ -780,34 +721,16 @@ class AutoMLPipeline:
         manifest: Dict[str, Any],
     ) -> None:
         importance = tuning_result.adapter.feature_importance()
-        spec_map = {
-            spec["name"]: spec.get("source") or spec["name"]
-            for spec in matrix.output_specs
-        }
-        importance["source_feature"] = importance["feature"].map(spec_map).fillna(
-            importance["feature"]
-        )
+        spec_map = {spec["name"]: spec.get("source") or spec["name"] for spec in matrix.output_specs}
+        importance["source_feature"] = importance["feature"].map(spec_map).fillna(importance["feature"])
         importance.to_csv(self.report_dir / "feature_importance.csv", index=False)
-        source_importance = aggregate_importance(
-            tuning_result.adapter.feature_importance(), matrix.output_specs
-        )
-        source_importance.to_csv(
-            self.report_dir / "feature_importance_by_source.csv", index=False
-        )
+        source_importance = aggregate_importance(tuning_result.adapter.feature_importance(), matrix.output_specs)
+        source_importance.to_csv(self.report_dir / "feature_importance_by_source.csv", index=False)
         predictions.to_csv(self.report_dir / "predictions.csv", index=False)
         test_predictions = predictions[predictions["split"] == "test"]
-        test_predictions.to_csv(
-            self.report_dir / "predictions_test.csv", index=False
-        )
-        if (
-            self.cfg.get("_runtime", {})
-            .get("split_metadata", {})
-            .get("strategy")
-            == "temporal"
-        ):
-            test_predictions.to_csv(
-                self.report_dir / "predictions_oot.csv", index=False
-            )
+        test_predictions.to_csv(self.report_dir / "predictions_test.csv", index=False)
+        if self.cfg.get("_runtime", {}).get("split_metadata", {}).get("strategy") == "temporal":
+            test_predictions.to_csv(self.report_dir / "predictions_oot.csv", index=False)
         save_metrics_json(self.report_dir / "metrics.json", metrics)
         if self.cfg["output"].get("save_model", True):
             model_path = self.work_dir / "model" / "model.txt"
@@ -827,10 +750,7 @@ class AutoMLPipeline:
             self.logger.info("[report] wrote %s plots", len(plot_paths))
         self.logger.info(
             "[report] top features: %s",
-            ", ".join(
-                f"{row.source_feature}={row.gain_pct:.3f}"
-                for row in source_importance.head(10).itertuples()
-            ),
+            ", ".join(f"{row.source_feature}={row.gain_pct:.3f}" for row in source_importance.head(10).itertuples()),
         )
 
     @staticmethod

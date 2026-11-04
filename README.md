@@ -267,7 +267,29 @@ train + valid, and PSI compares train with valid. Preprocessing and CV also use
 only pre-cutoff rows; the final model refits on train + valid. The time column
 is excluded from model features by default. `predictions_oot.csv`,
 `split_metadata.json`, and `metrics.json["evaluation"]` describe the OOT result.
+`metrics.json["oot"]["prediction_psi"]` compares the final model's OOT scores
+with validation scores. For random splits, the equivalent comparison is
+validation versus test under `metrics.json["test"]["prediction_psi"]`.
+Training rows are never included in the prediction-PSI reference.
 The old global train/valid/test fractions are used only by the random split.
+
+Prediction PSI uses quantile bins learned from the validation reference. Binary models
+compare positive-class probabilities. Multiclass models calculate PSI for each
+class probability and report the maximum class PSI in the scalar `value`, with
+per-class values under `per_class`.
+
+With cross-validation enabled, the validation reference scores are generated
+out of fold. A stratified K-fold partition is built over train + valid, each
+validation row receives one prediction from a model that did not see that row,
+and only those validation-row predictions are used for PSI. The final refitted
+model scores test/OOT. The result records the requested and effective bin
+counts after duplicate quantile edges are removed.
+Configure the bin count in the metrics section:
+
+```yaml
+metrics:
+  prediction_psi_bins: 10
+```
 
 Changing the cutoff invalidates splits, filtering, preprocessing, and matrix,
 but the cache remains reusable. Changing the time column or split strategy

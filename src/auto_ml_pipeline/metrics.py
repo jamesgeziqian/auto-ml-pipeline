@@ -22,6 +22,8 @@ from sklearn.metrics import (
     roc_curve,
 )
 
+_PSI_EPSILON = 1e-9
+
 
 def ks_statistic(y_true: np.ndarray, scores: np.ndarray) -> float:
     y_true = np.asarray(y_true).astype(int)
@@ -73,6 +75,133 @@ def _clean_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: _rounded(value) for key, value in payload.items()}
 
 
+def _probability_psi(
+    reference_scores: np.ndarray,
+    comparison_scores: np.ndarray,
+    n_bins: int,
+) -> Dict[str, Any]:
+    reference = np.asarray(reference_scores, dtype=np.float64).reshape(-1)
+    comparison = np.asarray(comparison_scores, dtype=np.float64).reshape(-1)
+    reference = reference[np.isfinite(reference)]
+    comparison = comparison[np.isfinite(comparison)]
+    result: Dict[str, Any] = {
+        "value": float("nan"),
+        "reference_n": len(reference),
+        "comparison_n": len(comparison),
+        "requested_bins": int(n_bins),
+        "bins": 0,
+    }
+    if reference.size == 0 or comparison.size == 0:
+        return result
+
+    quantiles = np.linspace(0.0, 1.0, int(n_bins) + 1)
+    internal_edges = np.quantile(reference, quantiles)[1:-1]
+    edges = np.unique(np.concatenate(([0.0], internal_edges, [1.0])))
+    if edges.size < 2:
+        edges = np.asarray([0.0, 1.0], dtype=np.float64)
+    n_used_bins = max(1, int(len(edges) - 1))
+    reference_bins = np.digitize(reference, edges[1:-1], right=False)
+    comparison_bins = np.digitize(comparison, edges[1:-1], right=False)
+    reference_counts = np.bincount(reference_bins, minlength=n_used_bins)
+    comparison_counts = np.bincount(comparison_bins, minlength=n_used_bins)
+    reference_share = reference_counts / max(1, reference_counts.sum())
+    comparison_share = comparison_counts / max(1, comparison_counts.sum())
+    mask = (reference_share > 0) | (comparison_share > 0)
+    reference_share = reference_share[mask] + _PSI_EPSILON
+    comparison_share = comparison_share[mask] + _PSI_EPSILON
+    result["value"] = float(np.sum((reference_share - comparison_share) * np.log(reference_share / comparison_share)))
+    result["bins"] = n_used_bins
+    return result
+
+
+def prediction_distribution_psi(
+    reference_probabilities: np.ndarray,
+    comparison_probabilities: np.ndarray,
+    task: str,
+    n_bins: int = 10,
+    *,
+    reference_name: str = "reference",
+    comparison_name: str = "comparison",
+    class_names: Optional[Sequence[Any]] = None,
+) -> Dict[str, Any]:
+    """Measure prediction-distribution drift with reference-derived bins.
+
+    Binary models use the positive-class probability. Multiclass models
+    calculate PSI separately for every class probability and report the
+    maximum class PSI as the scalar metric.
+    """
+    if task not in {"binary", "multiclass"}:
+        raise ValueError(f"Unsupported task for prediction PSI: {task!r}")
+    if int(n_bins) < 2:
+        raise ValueError("prediction PSI requires at least two bins")
+
+    reference = np.asarray(reference_probabilities, dtype=np.float64)
+    comparison = np.asarray(comparison_probabilities, dtype=np.float64)
+    if reference.ndim == 1:
+        reference = reference.reshape(-1, 1)
+    if comparison.ndim == 1:
+        comparison = comparison.reshape(-1, 1)
+    if reference.ndim != 2 or comparison.ndim != 2:
+        raise ValueError("prediction probabilities must be one- or two-dimensional")
+
+    if task == "binary":
+        if reference.shape[1] not in {1, 2} or comparison.shape[1] not in {1, 2}:
+            raise ValueError("binary prediction probabilities must have one or two columns")
+        reference_scores = reference[:, -1]
+        comparison_scores = comparison[:, -1]
+        result = _probability_psi(reference_scores, comparison_scores, int(n_bins))
+        result.update(
+            {
+                "reference": reference_name,
+                "comparison": comparison_name,
+                "score": "positive_probability",
+            }
+        )
+        return result
+
+    if reference.shape[1] != comparison.shape[1]:
+        raise ValueError("multiclass reference and comparison probabilities must have the same width")
+    if reference.shape[1] == 0:
+        raise ValueError("multiclass prediction probabilities must contain at least one class")
+
+    per_class: List[Dict[str, Any]] = []
+    for class_index in range(reference.shape[1]):
+        class_result = _probability_psi(
+            reference[:, class_index],
+            comparison[:, class_index],
+            int(n_bins),
+        )
+        class_name = (
+            class_names[class_index] if class_names is not None and class_index < len(class_names) else class_index
+        )
+        per_class.append(
+            {
+                "class": class_name,
+                "psi": class_result["value"],
+                "bins": class_result["bins"],
+            }
+        )
+
+    class_values = np.asarray(
+        [entry["psi"] for entry in per_class],
+        dtype=np.float64,
+    )
+    finite_values = class_values[np.isfinite(class_values)]
+    used_bins = max((int(entry["bins"]) for entry in per_class), default=1)
+    return {
+        "value": float(np.max(finite_values)) if finite_values.size else float("nan"),
+        "reference": reference_name,
+        "comparison": comparison_name,
+        "reference_n": len(reference),
+        "comparison_n": len(comparison),
+        "requested_bins": int(n_bins),
+        "bins": used_bins,
+        "score": "class_probability",
+        "aggregation": "max_class",
+        "per_class": per_class,
+    }
+
+
 def binary_metrics(
     y_true: np.ndarray,
     probabilities: np.ndarray,
@@ -92,7 +221,7 @@ def binary_metrics(
         "brier": brier_score_loss(y_true, scores),
         "positive_rate": float(np.mean(predictions)),
         "confusion_matrix": confusion_matrix(y_true, predictions, labels=[0, 1]).tolist(),
-        "n": int(len(y_true)),
+        "n": len(y_true),
     }
     try:
         result["auc"] = roc_auc_score(y_true, scores)
@@ -111,27 +240,15 @@ def multiclass_metrics(
     labels = list(range(probabilities.shape[1]))
     result: Dict[str, Any] = {
         "accuracy": accuracy_score(y_true, predictions),
-        "precision_macro": precision_score(
-            y_true, predictions, average="macro", zero_division=0, labels=labels
-        ),
-        "recall_macro": recall_score(
-            y_true, predictions, average="macro", zero_division=0, labels=labels
-        ),
-        "f1_macro": f1_score(
-            y_true, predictions, average="macro", zero_division=0, labels=labels
-        ),
-        "precision_weighted": precision_score(
-            y_true, predictions, average="weighted", zero_division=0, labels=labels
-        ),
-        "recall_weighted": recall_score(
-            y_true, predictions, average="weighted", zero_division=0, labels=labels
-        ),
-        "f1_weighted": f1_score(
-            y_true, predictions, average="weighted", zero_division=0, labels=labels
-        ),
+        "precision_macro": precision_score(y_true, predictions, average="macro", zero_division=0, labels=labels),
+        "recall_macro": recall_score(y_true, predictions, average="macro", zero_division=0, labels=labels),
+        "f1_macro": f1_score(y_true, predictions, average="macro", zero_division=0, labels=labels),
+        "precision_weighted": precision_score(y_true, predictions, average="weighted", zero_division=0, labels=labels),
+        "recall_weighted": recall_score(y_true, predictions, average="weighted", zero_division=0, labels=labels),
+        "f1_weighted": f1_score(y_true, predictions, average="weighted", zero_division=0, labels=labels),
         "log_loss": log_loss(y_true, probabilities, labels=labels),
         "confusion_matrix": confusion_matrix(y_true, predictions, labels=labels).tolist(),
-        "n": int(len(y_true)),
+        "n": len(y_true),
     }
     try:
         result["auc_ovr_macro"] = roc_auc_score(
@@ -150,9 +267,7 @@ def aggregate_importance(
     importance: pd.DataFrame,
     output_specs: Sequence[Dict[str, Any]],
 ) -> pd.DataFrame:
-    mapping = {
-        spec["name"]: spec.get("source") or spec["name"] for spec in output_specs
-    }
+    mapping = {spec["name"]: spec.get("source") or spec["name"] for spec in output_specs}
     frame = importance.copy()
     frame["source_feature"] = frame["feature"].map(mapping).fillna(frame["feature"])
     grouped = (
@@ -201,9 +316,7 @@ def save_metric_plots(
     top_importance: int,
     class_names: Sequence[str],
 ) -> List[str]:
-    config_dir = Path(
-        os.environ.get("MPLCONFIGDIR") or (Path(report_dir) / ".matplotlib")
-    )
+    config_dir = Path(os.environ.get("MPLCONFIGDIR") or (Path(report_dir) / ".matplotlib"))
     config_dir.mkdir(parents=True, exist_ok=True)
     os.environ["MPLCONFIGDIR"] = str(config_dir)
     os.environ.setdefault("XDG_CACHE_HOME", str(config_dir.parent))

@@ -151,6 +151,13 @@ def test_temporal_split_holdout_pipeline(tmp_path: Path) -> None:
     metrics = json.loads((run / "reports" / "metrics.json").read_text())
     assert metrics["evaluation"]["strategy"] == "temporal"
     assert metrics["oot"]["n"] == len(splits["test"])
+    prediction_psi = metrics["oot"]["prediction_psi"]
+    assert prediction_psi["reference"] == "validation"
+    assert prediction_psi["comparison"] == "oot"
+    assert prediction_psi["reference_n"] == len(splits["valid"])
+    assert prediction_psi["comparison_n"] == len(splits["test"])
+    assert prediction_psi["requested_bins"] == 10
+    assert 2 <= prediction_psi["bins"] <= 10
 
 
 def test_temporal_split_explicit_cutoff_and_positive_limits(tmp_path: Path) -> None:

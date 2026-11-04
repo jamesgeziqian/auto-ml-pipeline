@@ -161,6 +161,7 @@ DEFAULTS: Dict[str, Any] = {
         "threshold": "auto",
         "plots": True,
         "top_importance": 30,
+        "prediction_psi_bins": 10,
     },
     "output": {
         "report_dir": None,
@@ -439,6 +440,13 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ConfigError("preprocessing.categorical_encoding must be native, onehot, or ordinal.")
     if cfg["tuning"]["enabled"] and int(cfg["tuning"]["n_trials"]) < 1:
         raise ConfigError("tuning.n_trials must be >= 1 when tuning is enabled.")
+    prediction_psi_bins = cfg["metrics"].get("prediction_psi_bins", 10)
+    try:
+        prediction_psi_bins = int(prediction_psi_bins)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("metrics.prediction_psi_bins must be an integer.") from exc
+    if prediction_psi_bins < 2:
+        raise ConfigError("metrics.prediction_psi_bins must be >= 2.")
     cv = cfg["tuning"].get("cv") or {}
     if not isinstance(cv, dict):
         raise ConfigError("tuning.cv must be a mapping.")

@@ -161,6 +161,7 @@ def test_xgboost_ks_cross_validation_pipeline(tmp_path: Path) -> None:
     assert best["direction"] == "maximize"
     assert best["cv_enabled"] is True
     assert best["cv_folds"] == 3
+    assert best["prediction_psi_reference"] == "validation_oof"
 
     trials = pd.read_csv(work_dir / "tuning" / "trials.csv")
     assert len(trials) == 2
@@ -174,3 +175,9 @@ def test_xgboost_ks_cross_validation_pipeline(tmp_path: Path) -> None:
     metrics = json.loads((work_dir / "reports" / "metrics.json").read_text())
     assert "ks" in metrics["test"]
     assert metrics["test"]["n"] > 0
+    prediction_psi = metrics["test"]["prediction_psi"]
+    assert prediction_psi["reference"] == "validation_oof"
+    assert prediction_psi["comparison"] == "test"
+    splits = np.load(work_dir / "splits.npz")
+    assert prediction_psi["reference_n"] == len(splits["valid"])
+    assert prediction_psi["comparison_n"] == len(splits["test"])

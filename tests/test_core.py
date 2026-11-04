@@ -12,6 +12,7 @@ from auto_ml_pipeline.logging_utils import configure_logging
 from auto_ml_pipeline.metrics import (
     ks_statistic,
     multiclass_metrics,
+    prediction_distribution_psi,
     select_binary_threshold,
 )
 from auto_ml_pipeline.schema import discover_sources, load_labels
@@ -59,6 +60,49 @@ def test_multiclass_metrics() -> None:
     assert "auc_ovr_macro" in metrics
 
 
+def test_prediction_distribution_psi() -> None:
+    reference = np.asarray([[0.9, 0.1]] * 50 + [[0.1, 0.9]] * 50)
+    same = prediction_distribution_psi(
+        reference,
+        reference,
+        task="binary",
+        n_bins=5,
+    )
+    shifted = prediction_distribution_psi(
+        reference,
+        np.asarray([[0.05, 0.95]] * 100),
+        task="binary",
+        n_bins=5,
+    )
+    assert same["value"] == pytest.approx(0.0, abs=1e-8)
+    assert shifted["value"] > 0.1
+    assert same["reference"] == "reference"
+    assert same["requested_bins"] == 5
+    assert 2 <= same["bins"] <= 5
+
+    multiclass_reference = np.asarray(
+        [
+            [0.8, 0.1, 0.1],
+            [0.1, 0.8, 0.1],
+            [0.1, 0.1, 0.8],
+        ]
+    )
+    multiclass_result = prediction_distribution_psi(
+        multiclass_reference,
+        multiclass_reference,
+        task="multiclass",
+        n_bins=3,
+        class_names=["low", "medium", "high"],
+    )
+    assert multiclass_result["value"] == pytest.approx(0.0, abs=1e-8)
+    assert multiclass_result["aggregation"] == "max_class"
+    assert [row["class"] for row in multiclass_result["per_class"]] == [
+        "low",
+        "medium",
+        "high",
+    ]
+
+
 def test_load_config_and_overrides(tmp_path: Path) -> None:
     labels = tmp_path / "labels.csv"
     features = tmp_path / "features.csv"
@@ -94,19 +138,24 @@ def test_config_rejects_bad_fractions(tmp_path: Path) -> None:
     features.write_text("id,x\n1,0.1\n", encoding="utf-8")
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "\n".join(
-            [
-                "data:",
-                "  feature_paths: [features.csv]",
-                "  label_path: labels.csv",
-                "  train_fraction: 0.8",
-                "  valid_fraction: 0.2",
-                "  test_fraction: 0.2",
-            ]
-        ),
+        "data:\n  feature_paths: [features.csv]\n  label_path: labels.csv\n  train_fraction: 0.8\n  valid_fraction: 0.2\n  test_fraction: 0.2",
         encoding="utf-8",
     )
     with pytest.raises(ConfigError):
+        load_config(config_path)
+
+
+def test_config_rejects_bad_prediction_psi_bins(tmp_path: Path) -> None:
+    labels = tmp_path / "labels.csv"
+    features = tmp_path / "features.csv"
+    labels.write_text("id,target\n1,0\n2,1\n", encoding="utf-8")
+    features.write_text("id,x\n1,0.1\n2,0.2\n", encoding="utf-8")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "data:\n  feature_paths: [features.csv]\n  label_path: labels.csv\nmetrics:\n  prediction_psi_bins: 1",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="prediction_psi_bins"):
         load_config(config_path)
 
 

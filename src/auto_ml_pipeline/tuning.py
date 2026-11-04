@@ -32,6 +32,7 @@ class TuningResult:
     direction: str
     elapsed_seconds: float
     selection_valid_probabilities: Optional[np.ndarray] = None
+    oof_validation_probabilities: Optional[np.ndarray] = None
 
 
 def load_search_space(path: str | Path, logger: Any) -> Dict[str, Any]:
@@ -52,7 +53,7 @@ def suggest_params(trial: optuna.Trial, parameters: Dict[str, Any]) -> Dict[str,
     sampled: Dict[str, Any] = {}
     for name, spec in parameters.items():
         if not isinstance(spec, dict):
-            raise ValueError(f"Search space entry {name!r} must be a mapping.")
+            raise TypeError(f"Search space entry {name!r} must be a mapping.")
         kind = spec.get("type")
         if kind is None:
             kind = "float" if isinstance(spec.get("low"), float) or isinstance(spec.get("high"), float) else "int"
@@ -156,6 +157,81 @@ def _validation_metric(
             )
         )
     raise ValueError(f"Unsupported multiclass tuning metric {metric!r}.")
+
+
+def _cross_validated_validation_probabilities(
+    make_adapter: Any,
+    params: Dict[str, Any],
+    X_train: Any,
+    y_train: np.ndarray,
+    X_valid: Any,
+    y_valid: np.ndarray,
+    n_classes: int,
+    n_folds: int,
+    seed: int,
+    num_boost_round: int,
+    logger: Any,
+    X_reference: Any = None,
+    y_reference: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Predict validation rows out of fold under the selected configuration."""
+    if X_reference is None:
+        if sp.issparse(X_train):
+            X_reference = sp.vstack([X_train, X_valid], format="csr")
+        else:
+            X_reference = np.vstack([np.asarray(X_train), np.asarray(X_valid)])
+    if y_reference is None:
+        y_reference = np.concatenate([np.asarray(y_train), np.asarray(y_valid)])
+    n_train = len(y_train)
+    splitter = StratifiedKFold(
+        n_splits=int(n_folds),
+        shuffle=True,
+        random_state=int(seed),
+    )
+    probabilities = np.full(
+        (len(y_valid), int(n_classes)),
+        np.nan,
+        dtype=np.float64,
+    )
+    predicted = np.zeros(len(y_valid), dtype=bool)
+    rounds = max(1, int(num_boost_round))
+    logger.info(
+        "[psi] computing out-of-fold validation predictions with folds=%s seed=%s",
+        n_folds,
+        seed,
+    )
+    for fold_number, (fit_index, held_index) in enumerate(
+        splitter.split(np.zeros(len(y_reference), dtype=np.uint8), y_reference),
+        start=1,
+    ):
+        held_valid = np.asarray(held_index)
+        held_valid = held_valid[held_valid >= n_train]
+        if held_valid.size == 0:
+            continue
+        adapter = make_adapter(params)
+        adapter.fit(
+            X_reference[fit_index],
+            y_reference[fit_index],
+            X_valid=None,
+            y_valid=None,
+            num_boost_round=rounds,
+            callbacks=[],
+        )
+        local_index = held_valid - n_train
+        fold_probabilities = adapter.predict_proba(X_reference[held_valid])
+        if fold_probabilities.shape != (len(held_valid), int(n_classes)):
+            raise ValueError("Out-of-fold prediction shape does not match validation rows " "and classes.")
+        probabilities[local_index] = fold_probabilities
+        predicted[local_index] = True
+        logger.info(
+            "[psi] fold %s/%s: out-of-fold validation rows=%s",
+            fold_number,
+            n_folds,
+            len(held_valid),
+        )
+    if not predicted.all():
+        raise ValueError("Cross-validation did not produce an OOF prediction for every " "validation row.")
+    return probabilities
 
 
 def tune_and_train(
@@ -455,6 +531,8 @@ def tune_and_train(
     refit_on_train_valid = bool(tuning_cfg.get("refit_on_train_valid", True))
     final_adapter = make_adapter(best_params)
     selection_valid_probabilities: Optional[np.ndarray] = None
+    X_train_valid: Any = None
+    y_train_valid: Optional[np.ndarray] = None
     if refit_on_train_valid and X_valid is not None:
         # Keep an honest out-of-sample valid score: train the selected
         # configuration on train only, then refit on train+valid for the final model.
@@ -475,14 +553,14 @@ def tune_and_train(
             len(y_valid),
         )
         if sp.issparse(X_train):
-            X_fit = sp.vstack([X_train, X_valid], format="csr")
+            X_train_valid = sp.vstack([X_train, X_valid], format="csr")
         else:
-            X_fit = np.vstack([np.asarray(X_train), np.asarray(X_valid)])
-        y_fit = np.concatenate([y_train, y_valid])
+            X_train_valid = np.vstack([np.asarray(X_train), np.asarray(X_valid)])
+        y_train_valid = np.concatenate([y_train, y_valid])
         final_rounds = max(1, int(best_iteration)) if best_iteration else num_boost_round
         final_adapter.fit(
-            X_fit,
-            y_fit,
+            X_train_valid,
+            y_train_valid,
             X_valid=None,
             y_valid=None,
             num_boost_round=final_rounds,
@@ -499,6 +577,24 @@ def tune_and_train(
             callbacks=[],
         )
         selection_valid_probabilities = final_adapter.predict_proba(X_valid)
+
+    oof_validation_probabilities: Optional[np.ndarray] = None
+    if cv_enabled:
+        oof_validation_probabilities = _cross_validated_validation_probabilities(
+            make_adapter=make_adapter,
+            params=best_params,
+            X_train=X_train,
+            y_train=y_train,
+            X_valid=X_valid,
+            y_valid=y_valid,
+            n_classes=n_classes,
+            n_folds=cv_folds,
+            seed=cv_seed,
+            num_boost_round=(max(1, int(best_iteration)) if best_iteration else num_boost_round),
+            logger=logger,
+            X_reference=X_train_valid,
+            y_reference=y_train_valid,
+        )
 
     elapsed = time.perf_counter() - started
     summary = {
@@ -519,6 +615,7 @@ def tune_and_train(
         "cv_folds": cv_folds if cv_enabled else 0,
         "cv_seed": cv_seed if cv_enabled else None,
         "cv_prune_after_folds": cv_prune_after if cv_enabled else None,
+        "prediction_psi_reference": ("validation_oof" if cv_enabled else "validation"),
         "elapsed_seconds": round(elapsed, 4),
     }
     with (tuning_dir / "best_params.json").open("w", encoding="utf-8") as handle:
@@ -533,6 +630,7 @@ def tune_and_train(
         direction=direction,
         elapsed_seconds=elapsed,
         selection_valid_probabilities=selection_valid_probabilities,
+        oof_validation_probabilities=oof_validation_probabilities,
     )
 
 

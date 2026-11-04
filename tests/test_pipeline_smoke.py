@@ -110,9 +110,19 @@ def _run(tmp_path: Path, concat_mode: str = "column") -> dict:
     ]:
         assert (work_dir / relative).exists(), relative
     metrics = json.loads((work_dir / "reports/metrics.json").read_text())
-    for key in ["accuracy", "precision", "recall", "f1", "auc", "ks"]:
+    for key in [
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "auc",
+        "ks",
+        "prediction_psi",
+    ]:
         assert key in metrics["test"]
     assert metrics["test"]["n"] > 0
+    assert metrics["test"]["prediction_psi"]["reference"] == "validation"
+    assert metrics["test"]["prediction_psi"]["comparison"] == "test"
     summary_data = json.loads((work_dir / "run_summary.json").read_text())
     for stage in [
         "load_labels",
