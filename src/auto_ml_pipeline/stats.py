@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .cache import CacheStore
+from .config import ConfigError
 from .logging_utils import Heartbeat, rss_mb
 from .temporal import TemporalPSIWindows
 
@@ -419,6 +420,17 @@ def apply_filter_thresholds(
         str(row["column"]): row for row in report.to_dict("records")
     }
     keep_columns = {str(column) for column in fcfg.get("keep_columns", [])}
+    only_keep_columns = {
+        str(column) for column in (fcfg.get("only_keep_columns") or [])
+    }
+    if only_keep_columns:
+        missing = sorted(only_keep_columns.difference(stats))
+        if missing:
+            raise ConfigError(
+                "filtering.only_keep_columns contains columns unavailable after "
+                f"schema inference: {', '.join(missing)}"
+            )
+    force_keep_columns = only_keep_columns or keep_columns
     selected: List[str] = []
     reasons: Dict[str, str] = {}
 
@@ -426,7 +438,10 @@ def apply_filter_thresholds(
         column = str(row["column"])
         dtype = str(row["dtype"])
         fail_reasons: List[str] = []
-        if column in keep_columns:
+        if only_keep_columns and column not in only_keep_columns:
+            reasons[column] = "not_in_only_keep_columns"
+            continue
+        if column in force_keep_columns:
             selected.append(column)
             reasons[column] = "kept_by_config"
             continue

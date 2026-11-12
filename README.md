@@ -317,6 +317,7 @@ filtering:
   categorical_top_k: 50
   drop_identifiers: true
   keep_columns: []
+  only_keep_columns: []
   temporal_psi:
     enabled: false
     time_path: null
@@ -353,6 +354,16 @@ filtering:
   `psi_comparison_n` for each feature.
 - `max_pairwise_corr` optionally removes redundant numeric columns greedily,
   keeping the higher-scoring column from each correlated pair.
+- `keep_columns` force-keeps named features while normal filtering still
+  considers all other columns.
+- `only_keep_columns` is an exclusive allowlist. When non-empty, every listed
+  feature is force-kept and all other columns are rejected with reason
+  `not_in_only_keep_columns`. It takes precedence over `keep_columns`, and
+  unknown names raise a configuration error. Empty or `null` disables the
+  allowlist.
+- `max_features` and `max_pairwise_corr` still run after either force-keep
+  list. Set `max_features` to at least the allowlist size and
+  `max_pairwise_corr` to `null` when every allowlisted feature must survive.
 - The full per-column report is written to `filter_report.csv`.
 - If filtering removes every column, `filter_report.csv` is still written
   before the pipeline fails, so the rejection reason for each column remains

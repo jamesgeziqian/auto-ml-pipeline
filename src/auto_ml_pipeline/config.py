@@ -114,6 +114,7 @@ DEFAULTS: Dict[str, Any] = {
         },
         "drop_identifiers": True,
         "keep_columns": [],
+        "only_keep_columns": [],
         "min_row_coverage": 0.0,
     },
     "preprocessing": {
@@ -474,6 +475,18 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     if float(project["heartbeat_seconds"]) <= 0:
         raise ConfigError("project.heartbeat_seconds must be positive.")
     filtering = cfg["filtering"]
+    for key in ("keep_columns", "only_keep_columns"):
+        value = filtering.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            raise ConfigError(
+                f"filtering.{key} must be a list of column names or null."
+            )
+        if any(not isinstance(column, str) or not column.strip() for column in value):
+            raise ConfigError(
+                f"filtering.{key} must contain non-empty column names."
+            )
     iv_limits: Dict[str, Optional[float]] = {}
     for key in ("min_iv", "max_iv"):
         value = filtering.get(key)

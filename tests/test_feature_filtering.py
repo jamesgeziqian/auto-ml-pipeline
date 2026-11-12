@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 import yaml
 
-from auto_ml_pipeline.config import load_config
+from auto_ml_pipeline.config import ConfigError, load_config
 from auto_ml_pipeline.logging_utils import configure_logging
 from auto_ml_pipeline.pipeline import run_pipeline
 from auto_ml_pipeline.stats import compute_stats_and_filter
@@ -89,6 +89,83 @@ def test_max_iv_filters_high_signal_features(
     assert report.loc["high_signal", "iv"] > 1.0
     assert report.loc["high_signal", "selected"] == (max_iv is None)
     assert report.loc["high_signal", "reason"] == expected_reason
+
+
+def test_only_keep_columns_is_an_exclusive_force_keep_allowlist() -> None:
+    labels = np.tile([0, 1], 50)
+    frame = pd.DataFrame(
+        {
+            "picked_low_quality": np.zeros(len(labels)),
+            "picked_signal": np.random.default_rng(42).normal(size=len(labels)),
+            "automatic_high_signal": labels,
+        }
+    )
+    cfg: dict[str, Any] = {
+        "data": {"column_block_size": 8, "sample_rows": 100},
+        "filtering": {
+            "max_nan_ratio": 1.0,
+            "min_unique": 2,
+            "max_unique_ratio": 1.0,
+            "min_abs_pearson": 0.0,
+            "min_iv": 0.0,
+            "max_iv": None,
+            "max_psi": 10.0,
+            "max_features": 2,
+            "max_pairwise_corr": None,
+            "only_keep_columns": ["picked_low_quality", "picked_signal"],
+            "iv_bins": 10,
+            "psi_bins": 10,
+        },
+        "_runtime": {"n_classes": 2},
+    }
+    splits = {
+        "train": np.arange(60, dtype=np.int64),
+        "test": np.arange(60, 100, dtype=np.int64),
+    }
+
+    result = compute_stats_and_filter(
+        _FakeStore(frame),
+        labels,
+        splits,
+        cfg,
+        configure_logging("ERROR"),
+        _SilentHeartbeat(),
+    )
+    report = result.report.set_index("column")
+
+    assert set(result.selected) == {"picked_low_quality", "picked_signal"}
+    assert report.loc["picked_low_quality", "reason"] == "kept_by_config"
+    assert report.loc["picked_signal", "reason"] == "kept_by_config"
+    assert report.loc["automatic_high_signal", "selected"] == False
+    assert report.loc["automatic_high_signal", "reason"] == "not_in_only_keep_columns"
+
+
+def test_only_keep_columns_rejects_unknown_names() -> None:
+    labels = np.tile([0, 1], 50)
+    frame = pd.DataFrame({"available": np.arange(len(labels), dtype=float)})
+    cfg: dict[str, Any] = {
+        "data": {"column_block_size": 8, "sample_rows": 100},
+        "filtering": {
+            "only_keep_columns": ["missing"],
+            "iv_bins": 10,
+            "psi_bins": 10,
+        },
+        "_runtime": {"n_classes": 2},
+    }
+    splits = {
+        "train": np.arange(60, dtype=np.int64),
+        "test": np.arange(60, 100, dtype=np.int64),
+    }
+
+    with pytest.raises(ConfigError, match="only_keep_columns.*missing"):
+        compute_stats_and_filter(
+            _FakeStore(frame),
+            labels,
+            splits,
+            cfg,
+            configure_logging("ERROR"),
+            _SilentHeartbeat(),
+        )
 
 
 def test_pipeline_persists_filter_report_when_all_columns_are_rejected(

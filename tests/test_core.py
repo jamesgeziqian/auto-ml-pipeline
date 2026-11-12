@@ -159,6 +159,20 @@ def test_config_rejects_bad_prediction_psi_bins(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+def test_config_rejects_scalar_only_keep_columns(tmp_path: Path) -> None:
+    labels = tmp_path / "labels.csv"
+    features = tmp_path / "features.csv"
+    labels.write_text("id,target\n1,0\n2,1\n", encoding="utf-8")
+    features.write_text("id,x\n1,0.1\n2,0.2\n", encoding="utf-8")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "data:\n  feature_paths: [features.csv]\n  label_path: labels.csv\nfiltering:\n  only_keep_columns: x",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="only_keep_columns"):
+        load_config(config_path)
+
+
 def test_synthetic_generator(tmp_path: Path) -> None:
     info = generate_synthetic_dataset(
         tmp_path / "data",

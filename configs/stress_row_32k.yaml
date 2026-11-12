@@ -48,6 +48,7 @@ filtering:
   categorical_top_k: 50
   drop_identifiers: true
   keep_columns: []
+  only_keep_columns: []
 
 preprocessing:
   numeric_impute: median
